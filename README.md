@@ -10,7 +10,12 @@ It never changes your data. Every finding is a proposal with its numbers, for th
 2. Run it and choose the job folder.
    - With a CompNet project in the folder (`.TRV` and its companion files), it adjusts that project. Any `.GSI` files in the folder supply the instrument timestamps.
    - Otherwise it uses the raw files: `.GSI`, `.asc`, and a `.FIX` or `.STD` file for the control marks.
-3. Press **Run**. The report opens in your browser and is saved in the job folder as `static-survey-report.html` (and `.md`).
+3. Press **Run**. Four files are written to the job folder, named after the job, and the report opens in your browser:
+   - `JOB-report.html` (and `.md`): what was adjusted, the findings, the largest residuals and the adjusted coordinates.
+   - `JOB-coordinates.csv`: name, E, N, H, their standard deviations (m) and fixed / weighted / adjusted. The program reads the same layout as control, so one job's marks can be the next job's control.
+   - `JOB-network.dxf`: the network for AutoCAD (2000 format, metres, MGA2020 E/N with the AHD height as Z). Layers `SS-CONTROL`, `SS-MARKS`, `SS-NAMES`, `SS-TS`, `SS-GNSS`, `SS-ELLIPSES` (95% error ellipses, enlarged; the enlargement is written on the drawing) and `SS-FLAGGED` (red: readings set aside by the w-test, or named by a finding, labelled with the finding).
+
+   The drawing is not called `JOB.dxf` because CompNet writes its own drawing under that name.
 
 Windows may warn that the program is from an unknown publisher, because it isn't code-signed. Choose **More info**, then **Run anyway**.
 
@@ -37,7 +42,7 @@ The options box takes the same options as the command line, for example:
 
 ```
 pip install .
-static-survey compnet path/to/JOB --gsi path/to/JOB.GSI --out report.md
+static-survey compnet path/to/JOB --gsi path/to/JOB.GSI --out report.md --csv coordinates.csv --dxf network.dxf
 static-survey raw --gsi JOB.GSI --asc DAY1.asc --control JOB.FIX --geoid-grid au_ga_AUSGeoid2020_20180201.tif --out report.md
 ```
 

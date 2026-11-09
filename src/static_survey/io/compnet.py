@@ -369,9 +369,11 @@ def to_network(proj: CompnetProject, start: str = "provisional", sec_per_km: flo
 
 
 def read_control(path: str | Path):
-    """Control marks from a CompNet .FIX / .STD file or a CSV of name,E,N,H[,sdE,sdN,sdH].
+    """Control marks from a CompNet .FIX / .STD file or a CSV of name,E,N,H[,sdE,sdN,sdH][,anything].
 
-    Returns (fixed, weighted) dictionaries."""
+    A CSV mark with all three standard deviations above zero is weighted; one with them blank or zero is
+    fixed. Text after the numbers (such as the status column of static-survey's own coordinates file) is
+    ignored, as are header lines. Returns (fixed, weighted) dictionaries."""
     path = Path(path)
     fixed: dict[str, tuple[float, float, float]] = {}
     weighted: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = {}
@@ -387,11 +389,17 @@ def read_control(path: str | Path):
         if len(parts) < 4 or raw.lstrip().startswith("#"):
             continue
         try:
-            vals = [float(x) for x in parts[1:]]
+            enh = tuple(float(x) for x in parts[1:4])
         except ValueError:
             continue  # header line
-        if len(vals) >= 6:
-            weighted[parts[0]] = ((vals[0], vals[1], vals[2]), (vals[3], vals[4], vals[5]))
+        sds = []
+        for x in parts[4:7]:
+            try:
+                sds.append(float(x))
+            except ValueError:
+                break
+        if len(sds) == 3 and min(sds) > 0:
+            weighted[parts[0]] = (enh, tuple(sds))
         else:
-            fixed[parts[0]] = (vals[0], vals[1], vals[2])
+            fixed[parts[0]] = enh
     return fixed, weighted

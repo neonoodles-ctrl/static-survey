@@ -861,6 +861,40 @@ def _w_limit(res: Result, alpha: float) -> float:
     return float(stats.norm.isf(alpha / (2 * max(n, 1))))
 
 
+def data_snooping(net: Network, res: Result, alpha: float = 0.01, max_out: int = 25):
+    """Set the worst reading over the w-test limit aside and re-adjust, until nothing fails.
+
+    Returns ``(set_aside, keep, clean)``: ``[(sighting index, w when set aside, component)]`` in order, the
+    sightings kept, and the adjustment without the ones set aside; ``None`` if a re-adjustment fails.
+    The answer is kept on ``res`` so the wrong-point-number check and the drawing share one run."""
+    key = (alpha, max_out)
+    if key in res.snooped:
+        return res.snooped[key]
+    crit = _w_limit(res, alpha)
+    keep = list(range(len(net.sightings)))
+    set_aside: list[tuple[int, float, str]] = []
+    cur = res
+    out = None
+    while True:
+        if len(set_aside) >= max_out:
+            out = (set_aside, keep, cur)
+            break
+        rows = [r for r in cur.rows if r["kind"] in ("DIR", "ZEN", "DIST") and not math.isnan(r["w"])]
+        worst = max(rows, key=lambda r: r["w"], default=None)
+        if worst is None or worst["w"] <= crit:
+            out = (set_aside, keep, cur)
+            break
+        si = keep[worst["si"]]
+        set_aside.append((si, worst["w"], worst["kind"]))
+        keep = [i for i in keep if i != si]
+        try:
+            cur = adjust(_subset(net, keep))
+        except (np.linalg.LinAlgError, ValueError, KeyError):
+            break
+    res.snooped[key] = out
+    return out
+
+
 def swapped_names(net: Network, res: Result, alpha: float = 0.01, max_out: int = 25) -> list[Finding]:
     """Readings that fail the w-test and fit another mark seen from the same setup.
 
@@ -872,21 +906,11 @@ def swapped_names(net: Network, res: Result, alpha: float = 0.01, max_out: int =
     Repeats with the same proposal are reported together; two names booked the wrong way round at one
     setup are reported as a swap. Nothing is taken out of the job itself."""
     crit = _w_limit(res, alpha)
-    keep = list(range(len(net.sightings)))
-    out_order: list[tuple[int, float]] = []
-    cur = res
-    while len(out_order) < max_out:
-        rows = [r for r in cur.rows if r["kind"] in ("DIR", "ZEN", "DIST") and not math.isnan(r["w"])]
-        worst = max(rows, key=lambda r: r["w"], default=None)
-        if worst is None or worst["w"] <= crit:
-            break
-        si = keep[worst["si"]]
-        out_order.append((si, worst["w"]))
-        keep = [i for i in keep if i != si]
-        try:
-            cur = adjust(_subset(net, keep))
-        except (np.linalg.LinAlgError, ValueError, KeyError):
-            return []
+    snooped = data_snooping(net, res, alpha, max_out)
+    if snooped is None:
+        return []
+    set_aside, keep, cur = snooped
+    out_order = [(si, w) for si, w, _ in set_aside]
     if not out_order:
         return []
     clean_net, clean = _subset(net, keep), cur

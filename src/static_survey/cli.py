@@ -7,6 +7,23 @@ import json
 from pathlib import Path
 
 
+def _cad_files(args, job: str, net, res, findings) -> tuple[list[dict], list[str]]:
+    """Coordinate rows for the report, and the CSV / DXF when asked for. Returns (rows, names written)."""
+    from .cad import coordinate_rows, write_csv, write_dxf
+
+    rows, files = coordinate_rows(net, res), []
+    if args.csv:
+        write_csv(args.csv, rows)
+        files.append(Path(args.csv).name)
+        print(f"coordinates written to {args.csv}")
+    if args.dxf:
+        drawn = write_dxf(args.dxf, job, net, res, rows, findings)
+        files.append(Path(args.dxf).name)
+        print(f"drawing written to {args.dxf}: {drawn['marks']} marks, {drawn['ts_lines']} total station lines, "
+              f"{drawn['gnss_lines']} GNSS lines, {drawn['flagged']} flagged, ellipses x{drawn['ellipse_scale']:,.0f}")
+    return rows, files
+
+
 def _compnet(args) -> int:
     from .diagnose import diagnose
     from .io.compnet import read_out, read_project, to_network
@@ -39,7 +56,8 @@ def _compnet(args) -> int:
                  "as CompNet does.")
     notes.append("Vertical residuals here are on zenith angles (computed minus observed). CompNet prints vertical "
                  "angles, so its signs are reversed: +20\" here is -20\" in CompNet's listing.")
-    md = render(args.job or stem.name, net, res, findings, sources, compare, notes)
+    rows, files = _cad_files(args, args.job or stem.name, net, res, findings)
+    md = render(args.job or stem.name, net, res, findings, sources, compare, notes, coords=rows, files=files)
     if args.out:
         Path(args.out).write_text(md, encoding="utf-8")
         print(f"report written to {args.out}")
@@ -152,7 +170,8 @@ def _raw(args) -> int:
     notes.append("Vertical residuals are on zenith angles (computed minus observed); CompNet's vertical-angle "
                  "residuals have the opposite sign.")
     sources = [Path(x).name for x in (args.gsi or []) + (args.asc or []) + args.control]
-    md = render(args.job or "Raw job", net, res, findings, sources, compare, notes)
+    rows, files = _cad_files(args, args.job or "Raw job", net, res, findings)
+    md = render(args.job or "Raw job", net, res, findings, sources, compare, notes, coords=rows, files=files)
     if args.out:
         Path(args.out).write_text(md, encoding="utf-8")
         print(f"report written to {args.out}")
@@ -175,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
     c.add_argument("--job", help="job title for the report")
     c.add_argument("--out", help="write the Markdown report here")
     c.add_argument("--json", help="also write machine-readable results here")
+    c.add_argument("--csv", help="write adjusted coordinates here (name,E,N,H,sdE,sdN,sdH,status)")
+    c.add_argument("--dxf", help="write the network drawing here (AutoCAD 2000 DXF)")
     c.set_defaults(func=_compnet)
     r = sub.add_parser("raw", help="adjust and diagnose straight from GSI and Infinity files")
     r.add_argument("--gsi", action="append", help="Leica GSI raw file (repeatable)")
@@ -199,6 +220,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--job", help="job title for the report")
     r.add_argument("--out", help="write the Markdown report here")
     r.add_argument("--json", help="also write machine-readable results here")
+    r.add_argument("--csv", help="write adjusted coordinates here (name,E,N,H,sdE,sdN,sdH,status)")
+    r.add_argument("--dxf", help="write the network drawing here (AutoCAD 2000 DXF)")
     r.set_defaults(func=_raw)
     args = ap.parse_args(argv)
     return args.func(args)

@@ -120,6 +120,10 @@ class Result:
     extras: list[dict]
     iterations: int
     converged: bool
+    # A-priori 3x3 covariance (m^2) of each mark's E, N, H; zeros for fixed marks.
+    cov: dict[str, tuple] = field(default_factory=dict)
+    # Iterative data snooping on this result, kept by ``diagnose.data_snooping`` so it runs once.
+    snooped: dict = field(default_factory=dict, repr=False, compare=False)
 
 
 def _wrap(a):
@@ -381,13 +385,15 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
             group_vf_n[label] = s2 / len(sel)
 
     coords = {n: tuple(enh[idx[n]]) for n in names}
-    sd = {}
+    sd, cov = {}, {}
     for n in names:
         if n in col:
-            d = np.sqrt(np.diag(Q)[col[n]:col[n] + 3])
-            sd[n] = tuple(d)
+            block = Q[col[n]:col[n] + 3, col[n]:col[n] + 3]
+            sd[n] = tuple(np.sqrt(np.diag(block)))
+            cov[n] = tuple(map(tuple, block))
         else:
             sd[n] = (0.0, 0.0, 0.0)
+            cov[n] = ((0.0,) * 3,) * 3
     ex_out = []
     for k, ex in enumerate(extras):
         ex_out.append(dict(kind=ex.kind, label=ex.label, value=float(xpar[k]), sd=float(np.sqrt(Q[xcol[k], xcol[k]]))))
@@ -397,4 +403,4 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
         gnss[key + "_sd"] = float(np.sqrt(Q[cc, cc]))
     return Result(coords=coords, sd=sd, rows=rows_out, dof=dof, vf=vf, group_vf=group_vf,
                   group_vf_by_count=group_vf_n, orientations={s: float(params_o[k]) for k, s in enumerate(setups)},
-                  gnss=gnss, extras=ex_out, iterations=it, converged=converged)
+                  gnss=gnss, extras=ex_out, iterations=it, converged=converged, cov=cov)

@@ -2,7 +2,9 @@
 
 Pick a job folder. The window finds a CompNet project (``.TRV`` and friends) or the raw files (Leica GSI,
 Leica Infinity ``.asc`` and a ``.FIX``/``.STD`` control file), runs the adjustment and the cause-finding,
-and opens an HTML report saved next to the job files. Extra command options (``--rename``, ``--exclude``,
+and writes four files next to the job files, named after the job: ``JOB-report.html`` (opened in the
+browser) and ``.md``, ``JOB-coordinates.csv`` and ``JOB-network.dxf`` for AutoCAD. The DXF is not
+``JOB.dxf`` because CompNet writes its own drawing under that name. Extra command options (``--rename``, ``--exclude``,
 ``--file-settings`` ...) go in the options box exactly as on the command line.
 
 Started with arguments (``StaticSurvey.exe raw --gsi ...``) it runs the command line instead, without a
@@ -22,7 +24,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 GEOID_GRID = "au_ga_AUSGeoid2020_20180201.tif"
-REPORT_STEM = "static-survey-report"
 CSS = """
 body { font-family: Segoe UI, Arial, sans-serif; max-width: 980px; margin: 2em auto; padding: 0 1em;
        color: #1d2733; line-height: 1.45; }
@@ -59,16 +60,28 @@ def find_job(folder: Path) -> dict:
     )
 
 
+def outputs_for(folder: Path, name: str) -> dict[str, Path]:
+    """Where a run writes: the report (Markdown, then HTML), the coordinates and the drawing."""
+    return dict(md=folder / f"{name}-report.md", csv=folder / f"{name}-coordinates.csv",
+                dxf=folder / f"{name}-network.dxf")
+
+
+def job_name(folder: Path, job: dict, project: Path | None = None) -> str:
+    return (project or job["projects"][0]).name if job["projects"] else folder.name
+
+
 def command_for(folder: Path, job: dict, options: str, project: Path | None = None) -> list[str]:
     """The ``static-survey`` arguments for this folder: CompNet mode when there is a project, raw otherwise."""
     extra = shlex.split(options) if options.strip() else []
-    out = ["--out", str(folder / f"{REPORT_STEM}.md")]
+    name = job_name(folder, job, project)
+    o = outputs_for(folder, name)
+    out = ["--out", str(o["md"]), "--csv", str(o["csv"]), "--dxf", str(o["dxf"])]
     if job["projects"]:
         stem = project or job["projects"][0]
         args = ["compnet", str(stem)]
         for g in job["gsi"]:
             args += ["--gsi", str(g)]
-        return args + ["--job", stem.name] + out + extra
+        return args + ["--job", name] + out + extra
     if not job["gsi"] and not job["asc"]:
         raise ValueError("No CompNet project (.TRV) and no raw files (.GSI or .asc) in this folder.")
     args = ["raw"]
@@ -87,7 +100,7 @@ def command_for(folder: Path, job: dict, options: str, project: Path | None = No
         if grid is None:
             raise ValueError("This build has no geoid grid: give --geoid-grid FILE in the options.")
         args += ["--geoid-grid", str(grid)]
-    return args + ["--job", folder.name] + out + extra
+    return args + ["--job", name] + out + extra
 
 
 def to_html(md_path: Path) -> Path:
@@ -167,7 +180,7 @@ def gui() -> None:
     def show(*_):
         found.delete("1.0", "end")
         text = folder_var.get().strip().strip('"')
-        folder = Path(text)
+        folder = Path(text).resolve() if text else Path(text)
         if not text or not folder.is_dir():
             state["job"] = None
             return
@@ -192,7 +205,7 @@ def gui() -> None:
 
     def start():
         text = folder_var.get().strip().strip('"')
-        folder = Path(text)
+        folder = Path(text).resolve() if text else Path(text)
         if not text or not folder.is_dir() or not state["job"]:
             messagebox.showwarning("Static Survey", "Choose a job folder first.")
             return
@@ -208,14 +221,15 @@ def gui() -> None:
         def work():
             try:
                 printed = run_command(argv)
-                html = to_html(folder / f"{REPORT_STEM}.md")
-                root.after(0, done, printed, html, None)
+                o = outputs_for(folder, job_name(folder, state["job"], project))
+                html = to_html(o["md"])
+                root.after(0, done, printed, html, [o["csv"], o["dxf"]], None)
             except Exception:  # shown to the user, not swallowed
-                root.after(0, done, "", None, traceback.format_exc())
+                root.after(0, done, "", None, [], traceback.format_exc())
 
         threading.Thread(target=work, daemon=True).start()
 
-    def done(printed, html, error):
+    def done(printed, html, others, error):
         run_btn["state"] = "normal"
         if error:
             say(error)
@@ -223,6 +237,8 @@ def gui() -> None:
             return
         say(printed)
         say(f"Report: {html}")
+        for f in others:
+            say(f"Written: {f}")
         state["report"] = html
         open_btn["state"] = "normal"
         webbrowser.open(html.as_uri())

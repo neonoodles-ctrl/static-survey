@@ -48,7 +48,8 @@ def _explained_by(row: dict, findings: list[Finding]) -> str:
 
 
 def render(job: str, net: Network, res: Result, findings: list[Finding], sources: list[str],
-           compare: dict | None = None, notes: list[str] | None = None) -> str:
+           compare: dict | None = None, notes: list[str] | None = None, coords: list[dict] | None = None,
+           files: list[str] | None = None) -> str:
     L: list[str] = []
     L.append(f"# {job}: adjustment check and cause-finding")
     L.append("")
@@ -131,6 +132,8 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
     L.append("w is the residual divided by its own standard deviation (Baarda's w-test). CompNet prints the "
              "residual divided by the observation's standard deviation; the two are close when redundancy is high.")
     L.append("")
+    if coords:
+        L += _coordinates(res, coords, files)
     if notes:
         L.append("## Notes and limits")
         L.append("")
@@ -138,3 +141,30 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
             L.append(f"- {n}")
         L.append("")
     return "\n".join(L)
+
+
+def _coordinates(res: Result, rows: list[dict], files: list[str] | None) -> list[str]:
+    from .cad import sd_scale
+
+    k = sd_scale(res)
+    L = ["## Adjusted coordinates", ""]
+    if files:
+        L.append("Also written: " + ", ".join(f"`{f}`" for f in files) + ".")
+        L.append("")
+    L.append("MGA2020 zone 56, AHD heights. Standard deviations are the a-priori ones from the instrument settings"
+             + (f", scaled up by √(variance factor) = {k:.2f} because the variance factor is above 1." if k > 1 else
+                "; the variance factor is not above 1, so they are not scaled.")
+             + " The 95% error ellipse is the horizontal area the mark lies in with 95% confidence: half-length of "
+             "the long axis × half-length of the short axis, and the bearing of the long axis.")
+    L.append("")
+    L.append("| Mark | Status | E (m) | N (m) | H (m) | sd E (mm) | sd N (mm) | sd H (mm) | 95% ellipse (mm) |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
+    for r in rows:
+        if r["status"] == "fixed":
+            sds, ell = "| — | — | —", "held fixed"
+        else:
+            sds = f"| {r['sd_e'] * 1000:.1f} | {r['sd_n'] * 1000:.1f} | {r['sd_h'] * 1000:.1f}"
+            ell = f"{r['a'] * 1000:.1f} × {r['b'] * 1000:.1f} at {r['bearing']:.0f}°"
+        L.append(f"| {r['name']} | {r['status']} | {r['e']:.4f} | {r['n']:.4f} | {r['h']:.4f} {sds} | {ell} |")
+    L.append("")
+    return L
