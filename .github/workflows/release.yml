@@ -1,0 +1,60 @@
+name: Windows program
+
+# Builds StaticSurvey.exe on GitHub's Windows machine, tests it, and on a version tag (v*) attaches it to a
+# draft release. The geoid grid is downloaded from the PROJ CDN and checked against its known hash.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      GRID: au_ga_AUSGeoid2020_20180201.tif
+      GRID_SHA256: 1eb8bc33f6bf27e6f16d277ad4f38d92ffaec33a7e6e355b6f840a7ab79998af
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install
+        run: python -m pip install . pytest pyinstaller
+
+      - name: Tests
+        run: python -m pytest -q
+
+      - name: Geoid grid (AUSGeoid2020, Geoscience Australia, CC BY 4.0)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src/static_survey/data | Out-Null
+          Invoke-WebRequest "https://cdn.proj.org/$env:GRID" -OutFile "src/static_survey/data/$env:GRID"
+          $h = (Get-FileHash "src/static_survey/data/$env:GRID" -Algorithm SHA256).Hash.ToLower()
+          if ($h -ne $env:GRID_SHA256) { throw "geoid grid hash $h does not match" }
+
+      - name: Build StaticSurvey.exe
+        run: >
+          pyinstaller --noconfirm --clean --onefile --windowed --name StaticSurvey
+          --add-data "src/static_survey/data:static_survey/data"
+          --collect-data pyproj
+          src/static_survey/app.py
+
+      - name: Check the exe against the Linux reference
+        run: python tests/windows_smoke.py dist/StaticSurvey.exe
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: StaticSurvey
+          path: dist/StaticSurvey.exe
+
+      - name: Draft release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" dist/StaticSurvey.exe --draft --title "Static Survey ${{ github.ref_name }}" --notes "Download StaticSurvey.exe and run it. No install and no internet needed."
