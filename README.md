@@ -61,7 +61,7 @@ The tests use a made-up 6-mark network with planted mistakes. Each check must fi
 
 - Deflections of the vertical are not modelled. Trig heights are treated as AHD differences, as CompNet does.
 - Only Leica GSI-16, Leica Infinity `.asc` and CompNet 3.x projects are read.
-- Coordinates are MGA2020 zone 56 only. Jobs in other zones are not handled yet.
+- Coordinates are MGA2020 zone 56 only. A CompNet project in another zone, or one that doesn't say which zone it is in, stops with a message. So does a project with observation files the program doesn't read, such as levelling, horizontal angles, horizontal distances or azimuths.
 
 ## Geoid
 

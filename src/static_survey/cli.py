@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
@@ -26,18 +27,28 @@ def _cad_files(args, job: str, net, res, findings) -> tuple[list[dict], list[str
 
 def _compnet(args) -> int:
     from .diagnose import diagnose
-    from .io.compnet import read_out, read_project, to_network
+    from .io.compnet import project_zone, read_out, read_project, to_network, unsupported
     from .io.gsi import attach_times, read_gsi
     from .report import compare_with_compnet, render
 
     stem = Path(args.stem)
     proj = read_project(stem)
+    out_path = stem.with_suffix(".OUT")
+    out = read_out(out_path) if out_path.exists() else None
+    problems, unread = unsupported(stem, proj, out)
+    if problems:
+        print(f"static-survey stopped without adjusting {stem.name}:\n" + "\n".join(f"- {p}" for p in problems),
+              file=sys.stderr)
+        return 2
     net = to_network(proj, sec_per_km=args.refraction)
     sources = [p.name for p in sorted(stem.parent.glob(stem.name + ".*"))
                if p.suffix.upper() in (".TRV", ".DIR", ".VRT", ".SLP", ".GPS", ".VCV", ".FIX", ".STD", ".WGN", ".N",
                                        ".VAR", ".OUT")]
     notes = [f"Weights taken from CompNet's {', '.join(sorted(set(proj.weight_source.values())))} files, "
-             "as CompNet uses them (rounded copies of the .TRV values)."]
+             "as CompNet uses them (rounded copies of the .TRV values).",
+             f"MGA zone 56, from {project_zone(stem)[1]}."]
+    if unread:
+        notes.append("Not read, because they hold no observations: " + ", ".join(f"`{u}`" for u in unread) + ".")
     if proj.disabled:
         notes.append(f"{len(proj.disabled)} sighting(s) switched off in the .TRV with '*' were left out: "
                      + "; ".join(f"`{d}`" for d in proj.disabled))
@@ -48,10 +59,7 @@ def _compnet(args) -> int:
     if args.gsi:
         notes.append(f"Instrument timestamps matched to {timed} of {len(net.sightings)} sightings.")
     res, findings = diagnose(net)
-    compare = None
-    out_path = stem.with_suffix(".OUT")
-    if out_path.exists():
-        compare = compare_with_compnet(res, read_out(out_path))
+    compare = compare_with_compnet(res, out, net) if out is not None else None
     notes.append("Deflections of the vertical are not modelled; trig heights are treated as AHD differences, "
                  "as CompNet does.")
     notes.append("Vertical residuals here are on zenith angles (computed minus observed). CompNet prints vertical "
@@ -145,7 +153,7 @@ def _raw(args) -> int:
         return i.pointing_h, i.pointing_v
 
     res, findings = diagnose(net, pointing=pointing)
-    compare = compare_with_compnet(res, read_out(args.compare_out)) if args.compare_out else None
+    compare = compare_with_compnet(res, read_out(args.compare_out), net) if args.compare_out else None
     src = {k: sum(1 for l in info["provisional_log"] if k in l) for k in ("control", "GNSS", "radiated", "resection")}
     notes = [f"Built from raw files: {info['n_gsi_sightings']} GSI readings and {info['n_vectors']} Infinity "
              f"baselines. Starting coordinates computed here, not taken from CompNet "

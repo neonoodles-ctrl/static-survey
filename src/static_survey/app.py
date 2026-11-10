@@ -224,16 +224,18 @@ def gui() -> None:
                 o = outputs_for(folder, job_name(folder, state["job"], project))
                 html = to_html(o["md"])
                 root.after(0, done, printed, html, [o["csv"], o["dxf"]], None)
+            except RuntimeError as e:  # the command stopped and said why: show all of it
+                root.after(0, done, "", None, [], str(e), str(e).strip())
             except Exception:  # shown to the user, not swallowed
                 root.after(0, done, "", None, [], traceback.format_exc())
 
         threading.Thread(target=work, daemon=True).start()
 
-    def done(printed, html, others, error):
+    def done(printed, html, others, error, message=None):
         run_btn["state"] = "normal"
         if error:
             say(error)
-            messagebox.showerror("Static Survey", error.strip().splitlines()[-1])
+            messagebox.showerror("Static Survey", message or error.strip().splitlines()[-1])
             return
         say(printed)
         say(f"Report: {html}")

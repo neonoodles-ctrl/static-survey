@@ -11,7 +11,55 @@ from .adjust import Network, Result
 from .diagnose import Finding, worst_residuals
 
 
-def compare_with_compnet(res: Result, out) -> dict:
+def compare_residuals(res: Result, out) -> dict:
+    """Our residuals against the ones CompNet prints, line by line, per observation type.
+
+    Directions and distances share CompNet's sign (computed minus observed). CompNet prints vertical
+    angles, so its vertical residuals are negated to compare with our zenith residuals. A type is left out
+    when the two lists do not pair up sighting for sighting."""
+    lists = {"DIR": out.directions, "ZEN": out.verticals, "DIST": [x for x in out.distances if x["obs"] > 0]}
+    found = {}
+    for kind, ref in lists.items():
+        ours = [r for r in res.rows if r["kind"] == kind]
+        if not ours or len(ours) != len(ref) or any((a["frm"], a["to"]) != (b["frm"], b["to"]) for a, b in zip(ours, ref)):
+            continue
+        if kind == "DIST":
+            d = np.array([(a["res"] - b["res"]) * 1000 for a, b in zip(ours, ref)])
+        else:
+            sign = -1.0 if kind == "ZEN" else 1.0
+            d = np.array([a["res_sec"] - sign * b["res"] for a, b in zip(ours, ref)])
+        found[kind] = dict(n=len(d), rms=float(np.sqrt((d ** 2).mean())), max=float(np.abs(d).max()),
+                           unit="mm" if kind == "DIST" else '"')
+    return found
+
+
+def compare_weighted(net: Network, res: Result, out) -> dict | None:
+    """Corrections to the weighted control marks, ours and CompNet's.
+
+    With nothing held fixed, the observations cannot sense a shift of the whole network, so in least squares
+    the weighted mean (weights 1/sd^2) of the corrections to the weighted marks is zero in E, N and H."""
+    names = [n for n in net.weighted if n in out.weighted and n in res.coords]
+    if not names or net.fixed:
+        return None
+    mean_ours, mean_cn = [], []
+    for c, key in enumerate(("ve", "vn", "vh")):
+        w = np.array([1 / net.weighted[n][1][c] ** 2 for n in names])
+        v_ours = np.array([res.coords[n][c] - net.weighted[n][0][c] for n in names])
+        v_cn = np.array([out.weighted[n][key] for n in names])
+        mean_ours.append(float((w * v_ours).sum() / w.sum() * 1000))
+        mean_cn.append(float((w * v_cn).sum() / w.sum() * 1000))
+    # coordinate difference against CompNet's own printed standard deviation, worst component
+    worst = None
+    for n, a in out.adjusted.items():
+        for c, (k, s) in enumerate((("e", "sd_e"), ("n", "sd_n"), ("h", "sd_h"))):
+            if a[s] > 0:
+                ratio = abs(res.coords[n][c] - a[k]) / a[s]
+                if worst is None or ratio > worst["ratio"]:
+                    worst = dict(mark=n, comp="ENH"[c], diff=(res.coords[n][c] - a[k]) * 1000, sd=a[s] * 1000, ratio=ratio)
+    return dict(n=len(names), mean_ours=mean_ours, mean_compnet=mean_cn, worst=worst)
+
+
+def compare_with_compnet(res: Result, out, net: Network | None = None) -> dict:
     """Coordinate and statistic differences against a CompNet .OUT listing."""
     d = np.array([[(res.coords[n][c] - (a["e"], a["n"], a["h"])[c]) * 1000 for c in range(3)]
                   for n, a in out.adjusted.items()])
@@ -23,7 +71,10 @@ def compare_with_compnet(res: Result, out) -> dict:
                 max_h=float(np.abs(d[:, 2]).max()), rms=float(np.sqrt((d ** 2).mean())), worst=worst,
                 vf=res.vf, vf_compnet=out.variance_factor, dof=res.dof, dof_compnet=out.dof,
                 groups=res.group_vf, groups_compnet=out.group_variance, gnss=res.gnss,
-                gnss_compnet=out.gnss_params, sd_ratio_median=float(np.median(sd_ratio)) if sd_ratio else None)
+                gnss_compnet=out.gnss_params, sd_ratio_median=float(np.median(sd_ratio)) if sd_ratio else None,
+                residuals=compare_residuals(res, out),
+                weighted=compare_weighted(net, res, out) if net is not None else None,
+                n_weighted=3 * len(net.weighted) if net is not None else 0)
 
 
 def _explained_by(row: dict, findings: list[Finding]) -> str:
@@ -74,17 +125,36 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
 
     if compare:
         c = compare
+        wc = c.get("weighted")
         L.append("## Check against CompNet")
         L.append("")
-        L.append(f"Independent recomputation of the same job reproduces CompNet's adjusted coordinates for all "
-                 f"{c['n']} marks to **{max(c['max_e'], c['max_n'], c['max_h']):.2f} mm** or better "
-                 f"(largest differences: E {c['max_e']:.2f}, N {c['max_n']:.2f}, H {c['max_h']:.2f} mm, at {c['worst']}; "
-                 f"rms {c['rms']:.2f} mm).")
+        detail = (f"(largest differences: E {c['max_e']:.2f}, N {c['max_n']:.2f}, H {c['max_h']:.2f} mm, at {c['worst']}; "
+                  f"rms {c['rms']:.2f} mm)")
+        if wc:
+            L.append(f"Our coordinates differ from CompNet's by up to **{max(c['max_e'], c['max_n'], c['max_h']):.2f} mm** "
+                     f"over all {c['n']} marks {detail}. See *Weighted control* below for why.")
+        else:
+            L.append(f"Independent recomputation of the same job reproduces CompNet's adjusted coordinates for all "
+                     f"{c['n']} marks to **{max(c['max_e'], c['max_n'], c['max_h']):.2f} mm** or better {detail}.")
         L.append("")
+        names = {"DIR": "directions", "ZEN": "vertical angles", "DIST": "slope distances"}
+        rs = c.get("residuals") or {}
+        if rs:
+            def q(x, u):
+                return f"{x:.3f}{u}" if u == '"' else f"{x:.3f} {u}"
+            parts = [f"{names[k]} rms {q(v['rms'], v['unit'])} (largest {q(v['max'], v['unit'])}, {v['n']} lines)"
+                     for k, v in rs.items()]
+            text = "Residuals compared line by line with CompNet's listing: " + "; ".join(parts) + "."
+            missing = [names[k] for k in names if k not in rs]
+            if missing:
+                text += " Not compared, because the lists do not pair up sighting for sighting: " + ", ".join(missing) + "."
+            L += [text, ""]
         L.append("| | static-survey | CompNet |")
         L.append("|---|---|---|")
         L.append(f"| Variance factor | {c['vf']:.3f} | {c['vf_compnet']} |")
         L.append(f"| Degrees of freedom | {c['dof']} | {c['dof_compnet']} |")
+        dof_note = (c.get("n_weighted") and c["dof_compnet"] is not None
+                    and c["dof"] == c["dof_compnet"] + c["n_weighted"])
         for k in ("Direction", "Vertical angle", "Slope distance", "GNSS"):
             if k in c["groups"]:
                 L.append(f"| {k} group factor | {c['groups'][k]:.3f} | {c['groups_compnet'].get(k, '')} |")
@@ -93,9 +163,21 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
             L.append(f"| GNSS rotation (size) | {abs(c['gnss'].get('rotation', 0)) * 206264.806:.2f}\" | "
                      f"{abs(c['gnss_compnet'].get('Horizontal rotation', 0))}\" |")
         L.append("")
+        if dof_note:
+            L.append(f"CompNet does not count the {c['n_weighted']} weighted coordinates as observations: "
+                     f"{c['dof']} = {c['dof_compnet']} + {c['n_weighted']}.")
+            L.append("")
+        if wc:
+            L += _weighted_paragraph(wc)
         if c["sd_ratio_median"]:
-            L.append(f"CompNet's printed standard deviations equal the a-priori values × √(variance factor) "
-                     f"(ratio {c['sd_ratio_median']:.2f} after that scaling). With a variance factor of {c['vf']:.2f} "
+            r = c["sd_ratio_median"]
+            if f"{r:.2f}" == "1.00":
+                first = ("CompNet's printed standard deviations equal the a-priori values × √(variance factor) "
+                         f"(ratio {r:.2f} after that scaling).")
+            else:
+                first = (f"CompNet's printed standard deviations are {'smaller' if r < 1 else 'larger'} than the "
+                         f"a-priori values × √(variance factor): the median ratio is {r:.2f}.")
+            L.append(f"{first} With a variance factor of {c['vf']:.2f} "
                      f"that shrinks every printed standard deviation by {100 * (1 - math.sqrt(c['vf'])):.0f}%. "
                      "Scaling down when the factor is below 1 is a choice; the a-priori figures are the cautious ones.")
             L.append("")
@@ -141,6 +223,31 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
             L.append(f"- {n}")
         L.append("")
     return "\n".join(L)
+
+
+def _weighted_paragraph(wc: dict) -> list[str]:
+    def mm(x):
+        return f"{x:+.2f}" if abs(x) >= 0.005 else "0.00"
+    mo = ", ".join(mm(x) for x in wc["mean_ours"])
+    mc = ", ".join(mm(x) for x in wc["mean_compnet"])
+    L = ["### Weighted control", ""]
+    text = (f"Position comes from {wc['n']} weighted marks; none is held fixed. The observations cannot sense a shift "
+            "of the whole network, so in least squares the corrections to the weighted marks, weighted by 1/sd², "
+            f"average zero in E, N and H. Ours average {mo} mm (E, N, H). CompNet's printed corrections average {mc} mm. ")
+    # CompNet prints each correction to 0.1 mm, so its average is only known to +/-0.05 mm.
+    if max(abs(x) for x in wc["mean_compnet"]) > 0.05:
+        text += ("That is more than its 0.1 mm printing explains, so CompNet's coordinates are not the least squares "
+                 "solution for the weights it prints. Where the residuals above match, both programs fit the "
+                 "observations alike, and the difference lies mostly in how the whole network is shifted and turned "
+                 "onto the weighted marks. ")
+    else:
+        text += "Within its 0.1 mm printing that is zero too. "
+    w = wc["worst"]
+    if w:
+        text += (f"Measured against CompNet's own standard deviations, the largest difference is {w['diff']:+.1f} mm in "
+                 f"{w['comp']} at {w['mark']}: {w['ratio']:.2f} times CompNet's {w['sd']:.1f} mm there.")
+    L += [text, ""]
+    return L
 
 
 def _coordinates(res: Result, rows: list[dict], files: list[str] | None) -> list[str]:

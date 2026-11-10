@@ -22,7 +22,9 @@ example ``JOB.TRV``. The ones read here:
 
 from __future__ import annotations
 
+import math
 import re
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -252,11 +254,15 @@ class OutListing:
     vectors: list[dict] = field(default_factory=list)
     adjusted: dict[str, dict] = field(default_factory=dict)
     fixed: dict[str, tuple[float, float, float]] = field(default_factory=dict)
+    # WEIGHTED COORDINATE CORRECTIONS: per weighted mark, the input value and correction (m) per component
+    weighted: dict[str, dict] = field(default_factory=dict)
     variance_factor: float | None = None
     group_variance: dict[str, float] = field(default_factory=dict)
     dof: int | None = None
     gnss_params: dict[str, float] = field(default_factory=dict)
     header: list[str] = field(default_factory=list)
+    # titles of the observation sections (a title line followed by a FROM ... TO column header)
+    obs_sections: list[str] = field(default_factory=list)
 
 
 def read_out(path: str | Path) -> OutListing:
@@ -270,8 +276,11 @@ def read_out(path: str | Path) -> OutListing:
     while i < len(lines):
         l = lines[i]
         t = l.strip()
+        if t and i + 1 < len(lines) and lines[i + 1].strip().startswith("FROM ") and t == t.upper():
+            out.obs_sections.append(t)
+            sec = None  # a section this reader does not parse ends the one before it
         if t in ("DIRECTIONS", "VERTICAL ANGLES", "SLOPE DISTANCES", "GNSS VECTORS",
-                 "FIXED COORDINATES", "ADJUSTED COORDINATES"):
+                 "FIXED COORDINATES", "ADJUSTED COORDINATES", "WEIGHTED COORDINATE CORRECTIONS"):
             sec = t
             i += 1
             continue
@@ -280,7 +289,7 @@ def read_out(path: str | Path) -> OutListing:
         m = re.match(r"(Scale ppm|East slope|North slope|Horizontal rotation):\s*(-?\d+\.\d+)", t)
         if m:
             out.gnss_params[m.group(1)] = float(m.group(2))
-        m = re.match(r"(Direction|Vertical angle|Slope distance|GNSS):\s*(\d+\.\d+)\s+F TEST", t)
+        m = re.match(r"([A-Za-z][A-Za-z ]*?):\s*(\d+\.\d+)\s+F TEST", t)
         if m:
             out.group_variance[m.group(1)] = float(m.group(2))
         m = re.match(r"ESTIMATE OF VARIANCE FACTOR:\s*(\d+\.\d+)", t)
@@ -317,6 +326,17 @@ def read_out(path: str | Path) -> OutListing:
                     line=i + 1))
                 i += 3
                 continue
+        elif sec == "WEIGHTED COORDINATE CORRECTIONS":
+            # name  E vE SR  N vN SR  H vH SR
+            p = t.split()
+            if len(p) == 10 and not p[0].lstrip("-").replace(".", "").isdigit():
+                try:
+                    v = [float(x) for x in p[1:]]
+                except ValueError:
+                    v = None
+                if v:
+                    out.weighted[p[0]] = dict(e=v[0], ve=v[1], sr_e=v[2], n=v[3], vn=v[4], sr_n=v[5],
+                                              h=v[6], vh=v[7], sr_h=v[8])
         elif sec == "FIXED COORDINATES":
             p = t.split()
             if len(p) == 5 and p[0].isdigit():
@@ -328,6 +348,123 @@ def read_out(path: str | Path) -> OutListing:
                                           sd_n=float(p[4]), h=float(p[5]), sd_h=float(p[6]))
         i += 1
     return out
+
+
+# ------------------------------------------- what this reader cannot handle
+
+HANDLED_ZONES = (56,)
+OBS_SECTIONS = ("DIRECTIONS", "VERTICAL ANGLES", "SLOPE DISTANCES", "GNSS VECTORS")
+OBS_GROUPS = ("Direction", "Vertical angle", "Slope distance", "GNSS")
+# Project files that are read, and files CompNet writes that hold nothing this reader needs: listings,
+# drawings, binary matrices, import copies of the observations, settings. Any other project file that looks
+# like observations stops the run, since it may hold levelling, horizontal angles, horizontal distances or
+# azimuths, which this reader does not read.
+READ_FILES = (".TRV", ".DIR", ".VRT", ".SLP", ".GPS", ".VCV", ".FIX", ".STD", ".WGN", ".N", ".PTS", ".VAR",
+              ".FIN", ".CSV", ".OUT")
+OTHER_FILES = (".DXF", ".ERR", ".FB", ".GPD", ".INV", ".MRG", ".NC!", ".NCE", ".NCY", ".PAT", ".PT!", ".RES",
+               ".VR!", ".WWW")
+COPIES = {".GPP": ".GPS"}  # the GNSS vectors again in another form: fine only next to the file that is read
+_MGA = re.compile(r"^(MGA\s*(?:94|2020))\s+ZONE\s+(\d+)\s+PROJECTION$")
+
+
+def listing_projection(path: str | Path) -> str | None:
+    """The projection line in a CompNet listing header, e.g. 'MGA2020 ZONE 56 PROJECTION'."""
+    for raw in _lines(Path(path))[:20]:
+        t = raw.strip()
+        if "PROJECTION" in t:
+            return t
+    return None
+
+
+def project_zone(stem: str | Path) -> tuple[int | None, str]:
+    """The project's MGA zone and where it was found: the .OUT listing header, then the .FB copy of it, then
+    the reference position in .GPD (two float32 values, latitude and longitude in radians). A projection that
+    is not an MGA zone gives (None, its text); nothing found gives (None, '')."""
+    stem = Path(stem)
+    for ext in (".OUT", ".FB"):
+        p = stem.with_suffix(ext)
+        if p.exists():
+            text = listing_projection(p)
+            if text:
+                m = _MGA.match(text)
+                return (int(m.group(2)) if m else None), f"{p.name} header: '{text}'"
+    g = stem.with_suffix(".GPD")
+    if g.exists() and g.stat().st_size >= 8:
+        lat, lon = struct.unpack("<2f", g.read_bytes()[:8])
+        if abs(lat) <= math.pi / 2 and abs(lon) <= math.pi:
+            lon_d = math.degrees(lon)
+            return int((lon_d + 180) // 6) + 1, f"{g.name}: reference position at longitude {lon_d:.2f}°"
+    return None, ""
+
+
+def _looks_like_observations(path: Path) -> bool:
+    """A text file with lines that start with two point numbers followed by a number, as CompNet's
+    observation files do (``from to value ...``)."""
+    data = path.read_bytes()
+    if b"\0" in data[:4096]:
+        return False
+    for raw in data.decode("latin-1").splitlines():
+        p = raw.replace(",", " ").split()
+        if len(p) >= 3 and not p[0].startswith("*") and p[0].lstrip("-").isdigit() and p[1].lstrip("-").isdigit():
+            try:
+                float(p[2])
+                return True
+            except ValueError:
+                continue
+    return False
+
+
+def unsupported(stem: str | Path, proj: CompnetProject, out: OutListing | None = None) -> tuple[list[str], list[str]]:
+    """Reasons not to adjust this project, each a plain sentence, and the project files left unread because
+    they hold no observations. ``out`` is the project's .OUT listing when there is one."""
+    stem = Path(stem)
+    problems: list[str] = []
+    unread: list[str] = []
+    zone, where = project_zone(stem)
+    if zone is None and where:
+        problems.append(f"The projection is not an MGA zone ({where}). static-survey only handles MGA zone 56 so far.")
+    elif zone is None:
+        problems.append("The project does not say which MGA zone it is in: there is no .OUT or .FB listing and no "
+                        ".GPD file. static-survey only handles MGA zone 56 so far, and in another zone the "
+                        "coordinates would come out wrong.")
+    elif zone not in HANDLED_ZONES:
+        problems.append(f"The project is in MGA zone {zone} ({where}). static-survey only handles MGA zone 56 so far; "
+                        f"in zone {zone} the coordinates would come out wrong.")
+    have = {p.suffix.upper(): p for p in stem.parent.glob(stem.name + ".*") if p.is_file()}
+    for ext, p in sorted(have.items()):
+        if ext in READ_FILES or ext in OTHER_FILES:
+            continue
+        if ext in COPIES:
+            if COPIES[ext] not in have:
+                problems.append(f"{p.name} holds observations, but there is no {stem.name}{COPIES[ext]}, "
+                                "the file this program reads them from.")
+            continue
+        if _looks_like_observations(p):
+            problems.append(f"{p.name} looks like an observation file (its lines start with two point numbers), and "
+                            "this program does not read it. It may hold levelling, horizontal angles, horizontal "
+                            "distances or azimuths. Adjusting without them would not be the same job.")
+        else:
+            unread.append(p.name)
+    if out is not None:
+        for title in out.obs_sections:
+            if title not in OBS_SECTIONS:
+                problems.append(f"CompNet's listing has a section of observations this program does not read: "
+                                f"{title}. Adjusting without them would not be the same job.")
+        for group in out.group_variance:
+            if group not in OBS_GROUPS:
+                problems.append(f"CompNet adjusted a group of observations this program does not read: {group}.")
+        counts = (("directions", len(out.directions), len(proj.sightings)),
+                  ("vertical angles", len(out.verticals), len(proj.sightings)),
+                  ("slope distances", sum(1 for d in out.distances if d["obs"] > 0),
+                   sum(1 for s in proj.sightings if s.slope > 0)),
+                  ("GNSS vectors", len(out.vectors), len(proj.vectors)))
+        off = [f"{listed} {label} against {read}" for label, listed, read in counts if listed != read]
+        if off:
+            problems.append(f"CompNet's listing ({stem.name}.OUT) does not match the project files: "
+                            + "; ".join(off) + " (listing against files). The listing may be from an earlier run, or "
+                            "the project holds observations this program does not read. Run the job in CompNet "
+                            "again, or move the .OUT out of the folder.")
+    return problems, unread
 
 
 # ------------------------------------------------------------ to a Network

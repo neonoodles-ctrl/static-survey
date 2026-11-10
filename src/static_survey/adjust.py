@@ -61,10 +61,52 @@ class Vector:
     # XX XY XZ YY YZ ZZ). Only its correlations are used: they are rotated
     # into local east/north/up and rescaled to sd_h and sd_v, as CompNet does.
     cov_xyz: tuple[float, float, float, float, float, float] | None = None
+    # True: cov_xyz is the vector's covariance as it stands (DynAdjust); False: only its correlations are used
+    cov_given: bool = False
+
+
+@dataclass
+class Obs:
+    """A measurement beyond directions, zeniths, distances and GNSS vectors (used for DynAdjust jobs).
+
+    kind and stations:
+      ANGLE  [at, from, to]  horizontal angle, clockwise from ``from`` to ``to`` (radians)
+      AZ     [at, to]        geodetic azimuth (radians)
+      ASTRO  [at, to]        astronomic azimuth (radians); the Laplace correction comes from ``Network.dov``
+      VANGLE [at, to]        vertical angle between instrument and target (radians)
+      MSL    [a, b]          mean sea level arc distance (metres), reduced to the ellipsoid chord
+      LEVEL  [a, b]          orthometric height difference H(b) - H(a) (metres)
+      HEIGHT [a]             orthometric height (metres)
+      POS    [a, b, ...]     positions of one or more marks: ``value`` is their ECEF XYZ (3n), ``cov`` the full
+                             3n x 3n covariance (m^2)
+    """
+    kind: str
+    stations: list[str]
+    value: float | np.ndarray
+    sd: float | None = None
+    cov: np.ndarray | None = None
+    hi: float = 0.0
+    ht: float = 0.0
+    ref: str = ""
+
+
+@dataclass
+class Constraint:
+    """A station held along one local axis (east, north or up at the reference position) to ``ref_xyz``.
+    fixed=True holds it (DynAdjust 'C'): it counts as removing an unknown, not as an observation.
+    fixed=False is DynAdjust's weak prior on free stations ('F'): it counts as neither."""
+    station: str
+    axis: str
+    ref_xyz: tuple[float, float, float]
+    sd: float
+    fixed: bool
 
 
 def _vector_cov(v: "Vector", r_enu: np.ndarray) -> np.ndarray:
     target = np.array([v.sd_h, v.sd_h, v.sd_v])
+    if v.cov_given:
+        xx, xy, xz, yy, yz, zz = v.cov_xyz
+        return np.array([[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]])
     if v.cov_xyz is None:
         return r_enu.T @ np.diag(target**2) @ r_enu
     xx, xy, xz, yy, yz, zz = v.cov_xyz
@@ -104,6 +146,12 @@ class Network:
     # Values used for GNSS scale (fraction) and rotation (radians) when they
     # are not estimated, e.g. to replay another program's transformation.
     gnss_fixed: dict[str, float] = field(default_factory=dict)
+    # Further measurement types and station constraints (DynAdjust jobs), and the deflection of the vertical
+    # (xi north-south, eta east-west, radians) per mark. With deflections, zeniths, vertical angles, horizontal
+    # angles and astronomic azimuths are related to the ellipsoid normal as DynAdjust does (User's Guide 7.2).
+    measurements: list[Obs] = field(default_factory=list)
+    constraints: list[Constraint] = field(default_factory=list)
+    dov: dict[str, tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -128,6 +176,134 @@ class Result:
 
 def _wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def _more_rows(net, A, w, meta, r, idx, col, names, enh, nvals, xyz_g, jac_g, R, lat, con_axis) -> int:
+    """Whitened rows for ``net.measurements`` and ``net.constraints`` (User's Guide 7.2 for DynAdjust).
+    Positions are ellipsoidal (each mark's own N); every angle is taken in the local frame of the ellipsoid
+    normal at the instrument, and deflections of the vertical move the observed values onto that frame."""
+    up = R[:, 2]
+
+    def put(i_pt, grad_xyz, row):
+        n = names[i_pt]
+        if n in col:
+            A[row, col[n]:col[n] + 3] += grad_xyz @ jac_g[i_pt]
+
+    def vec(i, j, hi=0.0, ht=0.0):
+        return R[i] @ ((xyz_g[j] + ht * up[j]) - (xyz_g[i] + hi * up[i]))
+
+    def g_az(e, i):
+        rho2 = e[0] ** 2 + e[1] ** 2
+        return np.array([e[1] / rho2, -e[0] / rho2, 0.0]) @ R[i]
+
+    def g_zen(e, i):
+        rho = np.hypot(e[0], e[1])
+        return np.array([e[2] * e[0] / rho, e[2] * e[1] / rho, -rho]) / (e @ e) @ R[i]
+
+    def az_zen(e):
+        return np.arctan2(e[0], e[1]), np.arctan2(np.hypot(e[0], e[1]), e[2])
+
+    for mi, o in enumerate(net.measurements):
+        p = [idx[s] for s in o.stations]
+        xi, eta = net.dov.get(o.stations[0], (0.0, 0.0))
+        base = dict(kind=o.kind, mi=mi, frm=o.stations[0], to=o.stations[-1], ref=o.ref, sigma=o.sd, obs=o.value)
+        if o.kind == "POS":
+            n3 = len(o.value)
+            model = np.concatenate([xyz_g[i] for i in p])
+            L = np.linalg.cholesky(o.cov)
+            Linv = np.linalg.inv(L)
+            rows = slice(r, r + n3)
+            for q, i in enumerate(p):
+                if names[i] in col:
+                    A[r + 3 * q:r + 3 * q + 3, col[names[i]]:col[names[i]] + 3] += jac_g[i]
+            A[rows] = Linv @ A[rows]
+            w[rows] = Linv @ (np.asarray(o.value) - model)
+            for c3 in range(n3):
+                meta.append(dict(base, comp=c3, n3=n3, chol=L, point=o.stations[c3 // 3], sigma=None))
+            r += n3
+            continue
+        pre = 0.0
+        if o.kind == "ANGLE":
+            i, j, k = p
+            e1, e2 = vec(i, j), vec(i, k)
+            (t1, z1), (t2, z2) = az_zen(e1), az_zen(e2)
+            # observed angle = angle(normal) + eps (User's Guide eq. 7.29-7.30)
+            pre = (xi * np.sin(t2) - eta * np.cos(t2)) / np.tan(z2) - (xi * np.sin(t1) - eta * np.cos(t1)) / np.tan(z1)
+            model = (t2 - t1) % (2 * np.pi) + pre
+            ga, gb = g_az(e1, i), g_az(e2, i)
+            put(k, gb, r); put(j, -ga, r); put(i, ga - gb, r)
+            misc = _wrap(o.value - model)
+        elif o.kind in ("AZ", "ASTRO"):
+            i, j = p
+            e = vec(i, j)
+            t, z = az_zen(e)
+            if o.kind == "ASTRO":  # Laplace correction (eq. 7.41-7.42)
+                pre = eta * np.tan(lat[i]) + (xi * np.sin(t) - eta * np.cos(t)) / np.tan(z)
+            model = t + pre
+            g = g_az(e, i)
+            put(j, g, r); put(i, -g, r)
+            misc = _wrap(o.value - model)
+        elif o.kind == "VANGLE":
+            i, j = p
+            e = vec(i, j, o.hi, o.ht)
+            t, z = az_zen(e)
+            pre = xi * np.cos(t) + eta * np.sin(t)  # observed = angle(normal) + eps (eq. 7.39)
+            model = (np.pi / 2 - z) + pre
+            g = -g_zen(e, i)
+            put(j, g, r); put(i, -g, r)
+            misc = _wrap(o.value - model)
+        elif o.kind == "MSL":
+            i, j = p
+            sl = np.sin(lat[i])
+            nu = G.A / np.sqrt(1 - G.E2 * sl * sl)
+            rho_m = G.A * (1 - G.E2) / (1 - G.E2 * sl * sl) ** 1.5
+            Rm = np.sqrt(rho_m * nu)
+            n1, n2 = nvals[i], nvals[j]
+            rr = Rm + (n1 + n2) / 2                                     # eq. 7.9
+            mc = 2 * rr * np.sin(o.value / (2 * rr))                     # eq. 7.8
+            c_obs = np.sqrt((mc ** 2 - (n2 - n1) ** 2) / ((1 + n1 / Rm) * (1 + n2 / Rm)))  # eq. 7.10
+            h = enh[:, 2] + nvals
+            foot = {q: xyz_g[q] - h[q] * up[q] for q in (i, j)}      # on the ellipsoid, under each mark
+            d = foot[j] - foot[i]
+            model = float(np.linalg.norm(d))
+            u = d / model
+            for q, sgn in ((j, 1.0), (i, -1.0)):
+                if names[q] in col:
+                    sq = np.sin(lat[q])
+                    nq = G.A / np.sqrt(1 - G.E2 * sq * sq)
+                    A[r, col[names[q]]:col[names[q]] + 2] += sgn * (u @ jac_g[q][:, :2]) * nq / (nq + h[q])
+            pre = c_obs - o.value
+            misc = c_obs - model
+        elif o.kind == "LEVEL":
+            i, j = p
+            model = enh[j, 2] - enh[i, 2]
+            if names[j] in col:
+                A[r, col[names[j]] + 2] += 1.0
+            if names[i] in col:
+                A[r, col[names[i]] + 2] -= 1.0
+            pre = nvals[j] - nvals[i]
+            misc = o.value - model
+        elif o.kind == "HEIGHT":
+            (i,) = p
+            model = enh[i, 2]
+            if names[i] in col:
+                A[r, col[names[i]] + 2] += 1.0
+            pre = nvals[i]
+            misc = o.value - model
+        else:
+            raise ValueError(f"measurement kind {o.kind} is not handled")
+        A[r] /= o.sd
+        w[r] = misc / o.sd
+        meta.append(dict(base, model=model, pre=pre))
+        r += 1
+    for c, a in zip(net.constraints, con_axis):
+        i = idx[c.station]
+        if c.station in col:
+            A[r, col[c.station]:col[c.station] + 3] = (a @ jac_g[i]) / c.sd
+        w[r] = a @ (np.array(c.ref_xyz) - xyz_g[i]) / c.sd
+        meta.append(dict(kind="CON", frm=c.station, to=c.station, comp=c.axis, sigma=c.sd, ref="constraint"))
+        r += 1
+    return r
 
 
 def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, tol: float = 1e-6) -> Result:
@@ -178,6 +354,12 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
 
     n_obs = sum((s.hz is not None) + (s.zen is not None) + (s.slope is not None) for s in net.sightings)
     n_obs += 3 * len(net.vectors) + 3 * len(net.weighted)
+    n_obs += sum(len(o.value) if o.kind == "POS" else 1 for o in net.measurements) + len(net.constraints)
+    # Constraint axes, fixed once at each reference position.
+    con_axis = []
+    for c in net.constraints:
+        clat, clon, _ = G.ecef_to_geodetic(np.array(c.ref_xyz))
+        con_axis.append(G.enu_matrix(clat, clon)[0]["enu".index(c.axis)])
 
     converged = False
     first = True
@@ -257,6 +439,12 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
             if s.zen is not None:
                 zg = np.arctan2(rho, e[2])
                 model = zg - kref * rho / (2 * G.R_MEAN)
+                pre = 0.0
+                if s.frm in net.dov:  # observed from the plumb line: zeta(normal) = zeta(observed) + eps
+                    xi, eta = net.dov[s.frm]
+                    th = np.arctan2(e[0], e[1])
+                    pre = xi * np.cos(th) + eta * np.sin(th)
+                    model = model - pre
                 g_enu = np.array([e[2] * e[0] / rho, e[2] * e[1] / rho, -rho]) / S**2
                 g = g_enu @ R[i]
                 sig = s.sd_zen
@@ -268,7 +456,8 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
                         A[r, xcol[k]] = g @ up[j]
                 A[r] /= sig
                 w[r] = (s.zen - model) / sig
-                meta.append(dict(kind="ZEN", si=si, frm=s.frm, to=s.to, obs=s.zen, model=model, sigma=sig, ref=s.ref, setup=s.setup, time=s.time))
+                meta.append(dict(kind="ZEN", si=si, frm=s.frm, to=s.to, obs=s.zen, model=model, sigma=sig, ref=s.ref,
+                                 setup=s.setup, time=s.time, pre=pre))
                 r += 1
             if s.slope is not None:
                 model = S
@@ -314,9 +503,11 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
                 A[rows, gcol["rotation"]] = (1 + sc) * (K @ (Rot @ dX))
             A[rows] = Linv @ A[rows]
             w[rows] = Linv @ (np.array(v.dxyz) - model)
+            # standard deviations in local E, N, H: as given, or from the covariance when that is taken as given
+            sds = np.sqrt(np.diag(Ri @ cov @ Ri.T)) if v.cov_given else (v.sd_h, v.sd_h, v.sd_v)
             for comp in range(3):
                 meta.append(dict(kind="GNSS", vi=vi, comp="ENH"[comp], frm=v.frm, to=v.to, ref=v.ref,
-                                 enu_R=Ri, model=model, obs=np.array(v.dxyz), sd=(v.sd_h, v.sd_h, v.sd_v)[comp]))
+                                 enu_R=Ri, model=model, obs=np.array(v.dxyz), sd=float(sds[comp])))
             r += 3
 
         for n, (val, sd) in net.weighted.items():
@@ -325,6 +516,8 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
                 w[r] = (val[comp] - enh[idx[n], comp]) / sd[comp]
                 meta.append(dict(kind="CTRL", frm=n, to=n, comp="ENH"[comp], obs=val[comp], model=enh[idx[n], comp], sigma=sd[comp], ref="weighted control"))
                 r += 1
+
+        r = _more_rows(net, A, w, meta, r, idx, col, names, enh, nvals, xyz_g, jac_g, R, lat, con_axis)
 
         N = A.T @ A
         dxp = np.linalg.solve(N, A.T @ w)
@@ -347,17 +540,18 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
     vw = -w + A @ dxp
     hdiag = np.einsum("ij,jk,ik->i", A, Q, A)
     redund = np.clip(1.0 - hdiag, 0.0, 1.0)
-    dof = n_obs - nunk
+    # Constraint rows are neither observations nor unknowns; a held component removes one unknown.
+    dof = (n_obs - len(net.constraints)) - (nunk - sum(c.fixed for c in net.constraints))
     vf = float(vw @ vw / dof)
 
     rows_out: list[dict] = []
     for k, m in enumerate(meta):
         rec = dict(m)
-        if m["kind"] in ("DIR", "ZEN"):
+        if m["kind"] in ("DIR", "ZEN", "ANGLE", "AZ", "ASTRO", "VANGLE"):
             rec.update(res_sec=vw[k] * m["sigma"] / SEC, sigma_sec=m["sigma"] / SEC)
-        elif m["kind"] in ("DIST", "CTRL"):
+        elif m["kind"] in ("DIST", "CTRL", "MSL", "LEVEL", "HEIGHT", "CON"):
             rec.update(res=vw[k] * m["sigma"])
-        if m["kind"] != "GNSS":
+        if m["kind"] not in ("GNSS", "POS"):
             rec["v_over_sigma"] = abs(vw[k])
         rec["r"] = float(redund[k])
         rec["w"] = float(abs(vw[k]) / np.sqrt(redund[k])) if redund[k] > 1e-9 else float("nan")
@@ -366,16 +560,27 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
     # GNSS residuals in local E, N, H
     for k, m in enumerate(meta):
         if m["kind"] == "GNSS" and m["comp"] == "E":
-            v_enu = m["enu_R"] @ (m["model"] - m["obs"])
+            v_xyz = m["model"] - m["obs"]
+            v_enu = m["enu_R"] @ v_xyz
             for c3 in range(3):
                 rows_out[k + c3]["res"] = float(v_enu[c3])
+                rows_out[k + c3]["res_xyz"] = float(v_xyz[c3])
                 rows_out[k + c3]["v_over_sigma"] = abs(v_enu[c3]) / m["sd"]
+        if m["kind"] == "POS" and m["comp"] == 0:
+            n3 = m["n3"]
+            v_xyz = m["chol"] @ vw[k:k + n3]          # computed minus observed, metres
+            for c3 in range(n3):
+                rows_out[k + c3]["res_xyz"] = float(v_xyz[c3])
+                rows_out[k + c3]["v_over_sigma"] = abs(vw[k + c3])
     for rec in rows_out:
-        if rec["kind"] == "GNSS":
-            for key in ("enu_R", "model", "obs"):
+        if rec["kind"] in ("GNSS", "POS"):
+            for key in ("enu_R", "model", "obs", "chol"):
                 rec.pop(key, None)
 
-    groups = {"DIR": "Direction", "ZEN": "Vertical angle", "DIST": "Slope distance", "GNSS": "GNSS", "CTRL": "Control"}
+    groups = {"DIR": "Direction", "ZEN": "Vertical angle", "DIST": "Slope distance", "GNSS": "GNSS", "CTRL": "Control",
+              "ANGLE": "Horizontal angle", "AZ": "Azimuth", "ASTRO": "Astronomic azimuth",
+              "VANGLE": "Vertical angle (Z)", "MSL": "MSL arc", "LEVEL": "Levelling", "HEIGHT": "Height",
+              "POS": "GNSS point"}
     group_vf, group_vf_n = {}, {}
     for key, label in groups.items():
         sel = [k for k, m in enumerate(meta) if m["kind"] == key]

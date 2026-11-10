@@ -200,3 +200,33 @@ def test_every_mark_is_checked_in_a_braced_network():
 def test_dms():
     assert abs(dms_to_deg("294.095900") - (294 + 9 / 60 + 59 / 3600)) < 1e-12
     assert abs(dms_to_deg("-7.0534") - -(7 + 5 / 60 + 34 / 3600)) < 1e-12
+
+
+def test_weighted_control_corrections_average_zero():
+    """With only weighted control, least squares corrections to the weighted marks average zero (weights 1/sd^2);
+    a listing whose corrections do not is reported as not least squares, one that does is not."""
+    from types import SimpleNamespace
+
+    from static_survey.report import _weighted_paragraph, compare_weighted
+
+    net = build(seed=3)
+    off = {"A": (0.006, -0.004, 0.003), "C": (-0.002, 0.005, -0.004), "D": (0.001, 0.002, 0.005)}
+    net.weighted = {n: (tuple(TRUE[n][i] + off[n][i] for i in range(3)), (0.02, 0.02, 0.03)) for n in off}
+    net.fixed = {}
+    net.points = {n: c for n, c in TRUE.items()}
+    res = adjust(net)
+
+    def listing(shift):
+        adjusted = {n: dict(e=res.coords[n][0], n=res.coords[n][1], h=res.coords[n][2], sd_e=0.01, sd_n=0.01, sd_h=0.01)
+                    for n in TRUE}
+        weighted = {n: dict(ve=round(res.coords[n][0] - v[0] + shift, 4), vn=round(res.coords[n][1] - v[1], 4),
+                            vh=round(res.coords[n][2] - v[2], 4)) for n, (v, _) in net.weighted.items()}
+        return SimpleNamespace(adjusted=adjusted, weighted=weighted)
+
+    same = compare_weighted(net, res, listing(0.0))
+    assert max(abs(x) for x in same["mean_ours"]) < 1e-3                     # mm
+    assert max(abs(x) for x in same["mean_compnet"]) <= 0.05
+    assert "Within its 0.1 mm printing that is zero too" in _weighted_paragraph(same)[2]
+    moved = compare_weighted(net, res, listing(0.001))
+    assert abs(moved["mean_compnet"][0] - 1.0) < 0.06
+    assert "not the least squares solution" in _weighted_paragraph(moved)[2]
