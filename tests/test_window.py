@@ -184,3 +184,34 @@ def test_a_gnss_only_compnet_project_is_a_project():
     assert app.command_for(d, job, "")[:2] == ["compnet", str(d / "JOB")]
     s = st.Stage()
     assert not s.choose(Path("/jobs/b"), EMPTY) and ".GPS" in s.note
+
+
+def test_the_window_takes_the_screens_scale_but_never_more_than_fits():
+    """Windows stretched the fixed 1200 x 720 window: at 150% on 1920 x 1080 its bottom row was off the screen."""
+    from static_survey.ui.window import fit_scale
+
+    design = (1200, 720)
+    assert fit_scale(design, 1.0, (1904, 1000)) == 1.0                       # 1920 x 1080 at 100%: as drawn
+    assert fit_scale(design, 1.25, (1904, 990)) == 1.25                      # at 125%: Windows' scale
+    k = fit_scale(design, 1.5, (1904, 960))                                  # at 150%: held to what fits
+    assert round(k, 3) == round(960 / 720, 3) and 720 * k <= 960 and 1200 * k <= 1904
+    assert fit_scale(design, 1.5, (3824, 2000)) == 1.5                       # 3840 x 2160 at 150%
+    k = fit_scale(design, 1.0, (1008, 690))                                  # 1024 x 768: smaller than drawn
+    assert round(k, 3) == 0.84 and round(1200 * k) <= 1008
+
+
+def test_pictures_are_resized_and_rig_frames_laid_on_white_paper():
+    import io
+
+    from PIL import Image
+
+    from static_survey.ui.window import scaled_image
+
+    with Image.open(UI / "fold_000.png") as im:
+        w, h = im.size
+    frame = Image.open(io.BytesIO(scaled_image(UI / "fold_000.png", 1.5, on_paper=True)))
+    assert frame.size == (round(w * 1.5), round(h * 1.5)) and frame.mode == "L"
+    assert frame.getpixel((0, 0)) == 255                                     # transparent corner -> paper white
+    assert frame.getextrema()[0] < 64                                        # and the ink is still there
+    overlay = Image.open(io.BytesIO(scaled_image(UI / "overlay_panel.png", 0.84)))
+    assert overlay.size == (round(1200 * 0.84), round(720 * 0.84)) and overlay.mode == "RGBA"

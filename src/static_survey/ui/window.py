@@ -6,10 +6,14 @@ wires the clicks. What happens in which state lives in ``stage.py``.
 The rig stands in one of three places: "start" (the target is up), "ready" (the theodolite is out, telescope down
 and left) and "done" (turned half round, telescope up and right). The fold move joins the first two, the run move
 the last two, and the wait move is the small loop played while an adjustment is still going.
+
+The drawing is made for a 1200 x 720 window. The window is that times the screen's own scale (Windows' display
+setting), or smaller when that would not fit above the taskbar; everything in it scales by the one factor.
 """
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shlex
@@ -47,6 +51,59 @@ def shorten(text: str, font, room: int) -> str:
     return "…" + text
 
 
+def fit_scale(design: tuple[int, int], screen_scale: float, room: tuple[float, float]) -> float:
+    """How much to scale the drawing: by the screen's own scale, or less where the window would not fit `room`
+    (the space above the taskbar, less the title bar and borders)."""
+    return min(screen_scale, room[0] / design[0], room[1] / design[1])
+
+
+def scaled_image(path: Path, k: float, on_paper: bool = False) -> bytes:
+    """The picture at `path` resized by `k`, as image data Tk reads. A rig frame (`on_paper`) is laid on the white
+    paper and kept as a grey PGM, the quickest kind for Tk to read; an overlay keeps its transparency as PNG."""
+    from PIL import Image
+
+    with Image.open(path) as im:
+        size = (max(1, round(im.width * k)), max(1, round(im.height * k)))
+        if on_paper:
+            grey = im.convert("LA").resize(size, Image.LANCZOS)
+            out = Image.new("L", size, 255)
+            out.paste(grey.getchannel("L"), mask=grey.getchannel("A"))
+            kind = "PPM"
+        else:
+            out = im.convert("RGBA").resize(size, Image.LANCZOS)
+            kind = "PNG"
+    buf = io.BytesIO()
+    out.save(buf, kind)
+    return buf.getvalue()
+
+
+def windows_screen() -> tuple[float, tuple[int, int, int, int], tuple[int, int]]:
+    """On Windows: the display scale, the work area (left, top, right, bottom; the screen less the taskbar) and the
+    room a window's title bar and borders take (width, height), all in real pixels.
+
+    The program first tells Windows it draws for the screen's scale itself. Otherwise Windows stretches the whole
+    window, blurred, and at 150% on a 1920 x 1080 screen its bottom row ends up off the screen."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)        # the system's scale, Windows 8.1 and later
+    except (AttributeError, OSError):
+        ctypes.windll.user32.SetProcessDPIAware()
+    user32 = ctypes.windll.user32
+    try:
+        dpi = user32.GetDpiForSystem()                         # Windows 10 and later
+    except AttributeError:
+        dc = user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)        # LOGPIXELSX
+        user32.ReleaseDC(0, dc)
+    area = wintypes.RECT()
+    user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(area), 0)    # SPI_GETWORKAREA
+    edge = user32.GetSystemMetrics(32) + user32.GetSystemMetrics(92)  # SM_CXSIZEFRAME + SM_CXPADDEDBORDER
+    caption = user32.GetSystemMetrics(4)                                # SM_CYCAPTION
+    return dpi / 96, (area.left, area.top, area.right, area.bottom), (2 * edge, caption + 2 * edge)
+
+
 def run(folder: str | None = None) -> None:
     import tkinter as tk
     from tkinter import filedialog
@@ -55,10 +112,30 @@ def run(folder: str | None = None) -> None:
     from static_survey import app
 
     layout = json.loads((HERE / "layout.json").read_text(encoding="utf-8"))
-    width, height = layout["window"]
+    design = tuple(layout["window"])
+    place = ""
+    if sys.platform == "win32":
+        screen_scale, (left, top, right, bottom), (frame_w, frame_h) = windows_screen()   # before any window
+        k = fit_scale(design, screen_scale, (right - left - frame_w, bottom - top - frame_h))
     root = tk.Tk()
+    if sys.platform != "win32":     # elsewhere the drawing stays at its own size unless the screen is too small
+        k = fit_scale(design, 1.0, (root.winfo_screenwidth() - 20, root.winfo_screenheight() - 80))
+    width, height = round(design[0] * k), round(design[1] * k)
+    if sys.platform == "win32":     # in the middle of the space above the taskbar
+        place = (f"+{left + max(0, (right - left - width - frame_w) // 2)}"
+                 f"+{top + max(0, (bottom - top - height - frame_h) // 2)}")
+
+    def S(v: float) -> int:
+        """A length in the 1200 x 720 drawing, in this window's pixels."""
+        return round(v * k)
+
+    def picture(path: Path, on_paper: bool = False):
+        if k == 1:
+            return tk.PhotoImage(file=str(path))
+        return tk.PhotoImage(data=scaled_image(path, k, on_paper))   # raw bytes: Tk takes a PGM no other way
+
     root.title("Static Survey")
-    root.geometry(f"{width}x{height}")
+    root.geometry(f"{width}x{height}{place}")
     root.resizable(False, False)
     canvas = tk.Canvas(root, width=width, height=height, background=PAPER, highlightthickness=0)
     canvas.pack()
@@ -77,22 +154,22 @@ def run(folder: str | None = None) -> None:
                 break
         return font
 
-    f_title = sized(serif, 26, slant="italic")
-    f_body = sized(serif, 19)
-    f_ital = sized(serif, 20, slant="italic")
-    f_small = sized(serif, 16, slant="italic")
-    f_h2 = sized(serif, 23, weight="bold")
-    f_h3 = sized(serif, 20, weight="bold")
-    f_mono = sized(mono, 15)
+    f_title = sized(serif, 26 * k, slant="italic")
+    f_body = sized(serif, 19 * k)
+    f_ital = sized(serif, 20 * k, slant="italic")
+    f_small = sized(serif, 16 * k, slant="italic")
+    f_h2 = sized(serif, 23 * k, weight="bold")
+    f_h3 = sized(serif, 20 * k, weight="bold")
+    f_mono = sized(mono, 15 * k)
 
-    images = {name[:-4]: tk.PhotoImage(file=str(HERE / name)) for name in layout["images"]}
+    images = {name[:-4]: picture(HERE / name) for name in layout["images"]}
     count, delay = layout["moves"], round(1000 / layout["fps"])
     still = {st.START: ("fold", 0), st.READY: ("fold", count["fold"] - 1)}      # every other state: the run's end
     frames: dict[str, tk.PhotoImage] = {}
     motion = {"job": None, "at": "start"}       # the next frame's timer, and where the rig stands
-    rig_item = canvas.create_image(*layout["rig_xy"], anchor="nw")
+    rig_item = canvas.create_image(*map(S, layout["rig_xy"]), anchor="nw")
     overlay_item = canvas.create_image(0, 0, anchor="nw")
-    canvas.create_text(40, height - 10, anchor="sw", text=CREDIT, font=f_small, fill=FAINT)
+    canvas.create_text(S(40), height - S(10), anchor="sw", text=CREDIT, font=f_small, fill=FAINT)
 
     stage = st.Stage()
     project_var = tk.StringVar()
@@ -100,36 +177,38 @@ def run(folder: str | None = None) -> None:
     view = {"log": [], "details": False, "report": "", "closed": False}
 
     # ---- the strip under the rig: folder, project, options
-    fx0, fx1, fy = layout["fields"]["folder"]
-    px0, px1, py = layout["fields"]["project"]
-    ox0, ox1, oy = layout["fields"]["options"]
+    fx0, fx1, fy = map(S, layout["fields"]["folder"])
+    px0, px1, py = map(S, layout["fields"]["project"])
+    ox0, ox1, oy = map(S, layout["fields"]["options"])
     folder_text = canvas.create_text(fx0, fy, anchor="w", font=f_ital, fill=INK, tags="strip")
     project_text = canvas.create_text(px0, py, anchor="w", font=f_ital, fill=INK, tags=("strip", "project"))
     options_box = tk.Entry(canvas, textvariable=options_var, relief="flat", borderwidth=0, highlightthickness=0,
                            background=PAPER, foreground=INK, insertbackground=INK, font=f_body,
                            disabledbackground=PAPER, disabledforeground=FAINT)
-    options_item = canvas.create_window(ox0, oy, anchor="w", width=ox1 - ox0, height=22, window=options_box,
+    options_item = canvas.create_window(ox0, oy, anchor="w", width=ox1 - ox0, height=S(22), window=options_box,
                                         tags="strip")
-    caption_text = canvas.create_text(*layout["caption"], anchor="nw", font=f_ital, fill=INK, width=520, tags="ready")
-    note_text = canvas.create_text(width - 60, 420, anchor="e", font=f_ital, fill=INK, width=520, tags="start")
+    caption_text = canvas.create_text(*map(S, layout["caption"]), anchor="nw", font=f_ital, fill=INK, width=S(520),
+                                      tags="ready")
+    note_text = canvas.create_text(width - S(60), S(420), anchor="e", font=f_ital, fill=INK, width=S(520), tags="start")
 
     # ---- the panel in the telescope's line of sight
-    x0, y0, x1, y1 = layout["panel"]
-    title_text = canvas.create_text(x0 + 18, y0 + 26, anchor="w", font=f_title, fill=INK, tags="panel")
-    details_link = canvas.create_text(x1 - 18, y0 + 28, anchor="e", font=f_ital, fill=INK, tags=("panel", "link"))
+    x0, y0, x1, y1 = map(S, layout["panel"])
+    title_text = canvas.create_text(x0 + S(18), y0 + S(26), anchor="w", font=f_title, fill=INK, tags="panel")
+    details_link = canvas.create_text(x1 - S(18), y0 + S(28), anchor="e", font=f_ital, fill=INK, tags=("panel", "link"))
     body = tk.Text(canvas, wrap="word", relief="flat", borderwidth=0, highlightthickness=0, background=PAPER,
-                   foreground=INK, font=f_body, padx=4, pady=4, cursor="arrow", spacing1=1, spacing3=3)
-    scroll = tk.Scrollbar(canvas, orient="vertical", command=body.yview, width=10, relief="flat", borderwidth=0,
+                   foreground=INK, font=f_body, padx=S(4), pady=S(4), cursor="arrow", spacing1=S(1), spacing3=S(3))
+    scroll = tk.Scrollbar(canvas, orient="vertical", command=body.yview, width=S(10), relief="flat", borderwidth=0,
                           background="#cfcbc4", activebackground="#a8a39b", troughcolor=PAPER, highlightthickness=0,
                           elementborderwidth=0)
     body.configure(yscrollcommand=scroll.set)
-    canvas.create_window(x0 + 14, y0 + 50, anchor="nw", width=x1 - x0 - 40, height=y1 - y0 - 100, window=body,
+    canvas.create_window(x0 + S(14), y0 + S(50), anchor="nw", width=x1 - x0 - S(40), height=y1 - y0 - S(100),
+                         window=body, tags="panel")
+    canvas.create_window(x1 - S(24), y0 + S(50), anchor="nw", width=S(10), height=y1 - y0 - S(100), window=scroll,
                          tags="panel")
-    canvas.create_window(x1 - 24, y0 + 50, anchor="nw", width=10, height=y1 - y0 - 100, window=scroll, tags="panel")
-    body.tag_configure("h1", font=f_h2, spacing1=4, spacing3=6)
-    body.tag_configure("h2", font=f_h2, spacing1=12, spacing3=4)
-    body.tag_configure("h3", font=f_h3, spacing1=10, spacing3=3)
-    body.tag_configure("li", lmargin1=10, lmargin2=24)
+    body.tag_configure("h1", font=f_h2, spacing1=S(4), spacing3=S(6))
+    body.tag_configure("h2", font=f_h2, spacing1=S(12), spacing3=S(4))
+    body.tag_configure("h3", font=f_h3, spacing1=S(10), spacing3=S(3))
+    body.tag_configure("li", lmargin1=S(10), lmargin2=S(24))
     body.tag_configure("table", font=f_mono, wrap="none", spacing1=0, spacing3=0)
     body.tag_configure("log", font=f_mono)
     body.bind("<Shift-MouseWheel>", lambda e: body.xview_scroll(-1 if e.delta > 0 else 1, "units"))
@@ -140,15 +219,16 @@ def run(folder: str | None = None) -> None:
         for item in links.values():
             canvas.delete(item)
         links.clear()
-        x = x0 + 18
+        x = x0 + S(18)
         for name in opens:
-            links[name] = canvas.create_text(x, y1 - 22, anchor="w", text=name, font=f_ital, fill=INK, tags="panel")
-            x = canvas.bbox(links[name])[2] + 22
-        x = canvas.bbox(details_link)[0] - 22
+            links[name] = canvas.create_text(x, y1 - S(22), anchor="w", text=name, font=f_ital, fill=INK,
+                                             tags="panel")
+            x = canvas.bbox(links[name])[2] + S(22)
+        x = canvas.bbox(details_link)[0] - S(22)
         for name in reversed(actions):
-            links[name] = canvas.create_text(x, y0 + 28, anchor="e", text=name, font=f_ital, fill=INK, tags="panel")
-            x = canvas.bbox(links[name])[0] - 22
-        return x - (x0 + 18)                               # the room left for the title
+            links[name] = canvas.create_text(x, y0 + S(28), anchor="e", text=name, font=f_ital, fill=INK, tags="panel")
+            x = canvas.bbox(links[name])[0] - S(22)
+        return x - (x0 + S(18))                            # the room left for the title
 
     # ---- the rig and its moves
     def put(move: str, i: int) -> None:
@@ -156,7 +236,7 @@ def run(folder: str | None = None) -> None:
         if name not in frames:
             if len(frames) > 8:                 # the one on show is always the newest, so the oldest can go
                 frames.pop(next(iter(frames)))
-            frames[name] = tk.PhotoImage(file=str(HERE / f"{name}.png"))
+            frames[name] = picture(HERE / f"{name}.png", on_paper=True)
         canvas.itemconfigure(rig_item, image=frames[name])
 
     def moving() -> bool:
@@ -234,7 +314,7 @@ def run(folder: str | None = None) -> None:
         names = [p.name for p in job["projects"]]
         if names and project_var.get() not in names:
             project_var.set(names[0])
-        canvas.itemconfigure(project_text, text=shorten(project_var.get(), f_ital, px1 - px0 - 24) if names else "raw files",
+        canvas.itemconfigure(project_text, text=shorten(project_var.get(), f_ital, px1 - px0 - S(24)) if names else "raw files",
                              fill=INK if names else FAINT)
         options_box.configure(state="disabled" if state == st.RUNNING else "normal")
         canvas.itemconfigure(caption_text, text="\n".join(st.found_lines(job)))
@@ -357,7 +437,7 @@ def run(folder: str | None = None) -> None:
 
     def live_at(x: float, y: float) -> bool:
         part = stage.live_part()
-        return bool(part) and st.inside(layout["live"][part], x, y)
+        return bool(part) and st.inside(layout["live"][part], x / k, y / k)
 
     def click(event) -> None:
         if moving():
@@ -377,7 +457,7 @@ def run(folder: str | None = None) -> None:
         over = live_at(event.x, event.y) or (stage.state in (st.DONE, st.FAILED) and link_at(event.x, event.y))
         box = canvas.bbox(project_text)
         over = over or (stage.state not in (st.START, st.RUNNING) and bool(stage.job and len(stage.job["projects"]) > 1)
-                        and box[0] <= event.x <= px1 and abs(event.y - py) < 14)
+                        and box[0] <= event.x <= px1 and abs(event.y - py) < S(14))
         canvas.configure(cursor="hand2" if over else "")
 
     def close() -> None:
