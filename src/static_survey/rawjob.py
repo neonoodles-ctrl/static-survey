@@ -107,6 +107,30 @@ class RawJob:
     epsg: int = 7856
 
 
+class Unsupported(ValueError):
+    """A raw job this program can't adjust faithfully; the message says why."""
+
+
+def asc_zone(baselines: list[Baseline]) -> int:
+    """The MGA zone of the Infinity baselines' station positions (Earth-centred XYZ in the .asc). Raises Unsupported
+    when they lie in more than one zone, or outside the zones this program handles."""
+    from .io.compnet import HANDLED_ZONES, ZONES_TEXT
+
+    zones: dict[int, set[str]] = {}
+    for b in baselines:
+        for name, xyz in ((b.frm, np.array(b.from_xyz)), (b.to, np.array(b.from_xyz) + np.array(b.dxyz))):
+            _, lon, _ = G.ecef_to_geodetic(xyz)
+            zones.setdefault(int((math.degrees(float(lon[0])) + 180) // 6) + 1, set()).add(name)
+    if len(zones) > 1:
+        raise Unsupported("The .asc station positions lie in more than one MGA zone: "
+                          + "; ".join(f"zone {z}: {', '.join(sorted(n))}" for z, n in sorted(zones.items()))
+                          + ". One job is computed in one zone.")
+    (zone,) = zones
+    if zone not in HANDLED_ZONES:
+        raise Unsupported(f"The .asc station positions are in MGA zone {zone}. static-survey handles {ZONES_TEXT}.")
+    return zone
+
+
 def geoid_function(grid: str | Path | None, table: dict[str, float] | None, epsg: int = 7856):
     tr = None
     if grid is not None:
@@ -152,6 +176,11 @@ def build(job: RawJob) -> tuple[Network, dict]:
     baselines: list[Baseline] = []
     for a in job.asc:
         baselines += read_asc(a)
+    # The .asc files say where the job is; GSI files alone do not, so a GSI-only job stays in job.epsg (zone 56).
+    epsg, grid = job.epsg, {}
+    if baselines:
+        zone = asc_zone(baselines)
+        epsg, grid = 7800 + zone, dict(grid=f"MGA2020 zone {zone}")
     # The same mark can carry a different name in the field file than in the project.
     rn = job.rename
     for r in raw:
@@ -177,12 +206,12 @@ def build(job: RawJob) -> tuple[Network, dict]:
             sh, sv = round(sh, 3), round(sv, 3)
         vectors.append(Vector(b.frm, b.to, b.dxyz, sh, sv, ref=b.source, cov_xyz=b.cov))
 
-    n_at = geoid_function(job.geoid_grid, job.geoid_table, job.epsg)
+    n_at = geoid_function(job.geoid_grid, job.geoid_table, epsg)
     known = dict(job.fixed)
     for n, (val, _) in job.weighted.items():
         known.setdefault(n, val)
     level_n = float(np.mean([n_at(n, c[0], c[1]) for n, c in known.items()]))
-    coords, log = provisional(known, sightings, vectors, n_at, job.epsg, k, level_n=level_n)
+    coords, log = provisional(known, sightings, vectors, n_at, epsg, k, level_n=level_n)
 
     # Standard errors from the instrument settings (CompNet-supplied extras keep theirs).
     for r, s in zip(raw, sightings[: len(sightings) - len(job.extra_sightings)]):
@@ -205,7 +234,7 @@ def build(job: RawJob) -> tuple[Network, dict]:
     geoid = {n: n_at(n, coords[n][0], coords[n][1]) for n in names | set(known)}
     points = {n: c for n, c in coords.items() if n not in job.fixed}
     net = Network(points=points, geoid=geoid, fixed=dict(job.fixed), weighted=dict(job.weighted),
-                  sightings=sightings, vectors=vectors, epsg=job.epsg, refraction_k=k)
+                  sightings=sightings, vectors=vectors, epsg=epsg, refraction_k=k, **grid)
     info = dict(n_gsi_sightings=len(raw), n_extra=len(job.extra_sightings), n_vectors=len(vectors),
                 provisional_log=log, level_n=level_n)
     return net, info

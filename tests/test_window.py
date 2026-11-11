@@ -163,3 +163,24 @@ def test_closing_the_window_stops_a_run_in_hand(monkeypatch):
     run.join(10)
     assert not run.is_alive() and len(ended) == 1
     assert app.stop_running() is False                                 # nothing left to stop
+
+
+def test_a_gnss_only_compnet_project_is_a_project():
+    """A GNSS-only project has a .GPS and no .TRV: it was turned down, or run as raw files in zone 56."""
+    from static_survey import app
+
+    d = Path(__file__).resolve().parents[1] / "output" / "scratch" / "pytest-window" / "gnss-only"
+    d.mkdir(parents=True, exist_ok=True)
+    for f in d.iterdir():
+        f.unlink()
+    (d / "JOB.GPS").write_text("", encoding="utf-8")
+    (d / "JOB.FIX").write_text("", encoding="utf-8")
+    job = app.find_job(d)
+    assert [p.name for p in job["projects"]] == ["JOB"]
+    (d / "day1.asc").write_text("", encoding="utf-8")       # the field files sit beside the project
+    (d / "JOB.TRV").write_text("", encoding="utf-8")       # and a project with both is still one project
+    job = app.find_job(d)
+    assert [p.name for p in job["projects"]] == ["JOB"]
+    assert app.command_for(d, job, "")[:2] == ["compnet", str(d / "JOB")]
+    s = st.Stage()
+    assert not s.choose(Path("/jobs/b"), EMPTY) and ".GPS" in s.note

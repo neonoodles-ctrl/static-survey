@@ -44,13 +44,14 @@ def bundled_geoid() -> Path | None:
 
 
 def find_job(folder: Path) -> dict:
-    """What the folder holds: CompNet project stems, GSI and .asc files, control files."""
+    """What the folder holds: CompNet project stems, GSI and .asc files, control files. A project is a stem with a
+    .TRV (total station) or a .GPS (GNSS vectors) file; a GNSS-only project has no .TRV."""
     files = sorted(p for p in folder.iterdir() if p.is_file())
     by_ext: dict[str, list[Path]] = {}
     for p in files:
         by_ext.setdefault(p.suffix.lower(), []).append(p)
     return dict(
-        projects=[p.with_suffix("") for p in by_ext.get(".trv", [])],
+        projects=sorted({p.with_suffix("") for p in by_ext.get(".trv", []) + by_ext.get(".gps", [])}),
         gsi=by_ext.get(".gsi", []),
         asc=by_ext.get(".asc", []),
         control=by_ext.get(".fix", []) + by_ext.get(".std", []),
@@ -80,7 +81,7 @@ def command_for(folder: Path, job: dict, options: str, project: Path | None = No
             args += ["--gsi", str(g)]
         return args + ["--job", name] + out + extra
     if not job["gsi"] and not job["asc"]:
-        raise ValueError("No CompNet project (.TRV) and no raw files (.GSI or .asc) in this folder.")
+        raise ValueError("No CompNet project (.TRV or .GPS) and no raw files (.GSI or .asc) in this folder.")
     args = ["raw"]
     for g in job["gsi"]:
         args += ["--gsi", str(g)]

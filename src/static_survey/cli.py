@@ -115,7 +115,7 @@ def _settings_text(inst) -> str:
 def _raw(args) -> int:
     from .diagnose import diagnose
     from .io.compnet import read_control, read_out, read_project, to_network
-    from .rawjob import Instrument, RawJob, build
+    from .rawjob import Instrument, RawJob, Unsupported, build
     from .report import compare_with_compnet, render
 
     fixed, weighted = {}, {}
@@ -152,7 +152,11 @@ def _raw(args) -> int:
     job = RawJob(rename=rename, file_instruments=per_file, gsi=args.gsi or [], asc=args.asc or [], fixed=fixed, weighted=weighted, instrument=inst,
                  geoid_grid=args.geoid_grid, geoid_table=geoid_table, refraction_sec_per_km=args.refraction, extra_sightings=extra,
                  exclude=set(args.exclude or []), round_like_compnet=args.round_like_compnet)
-    net, info = build(job)
+    try:
+        net, info = build(job)
+    except Unsupported as exc:
+        print(f"static-survey stopped without adjusting {args.job or 'the raw job'}:\n- {exc}", file=sys.stderr)
+        return 2
 
     def pointing(s):
         i = per_file.get(s.ref.split(" line ")[0], inst)

@@ -103,12 +103,12 @@ def write_gsi(path, stations=("A", "B", "D"), reps=2, hi=1.5, ht=1.6):
     path.write_text("\r\n".join(lines) + "\r\n", encoding="latin-1")
 
 
-def write_asc(path, pairs=(("A", "E"),)):
-    """Infinity .asc export with exact vectors between true marks."""
+def write_asc(path, pairs=(("A", "E"),), epsg=7856):
+    """Infinity .asc export with exact vectors between true marks (TRUE read as grid coordinates in ``epsg``)."""
     names = list(TRUE)
     e = np.array([TRUE[n][0] for n in names]); n_ = np.array([TRUE[n][1] for n in names])
     h = np.array([TRUE[n][2] for n in names]) + N0
-    lat, lon = G.grid_to_latlon(e, n_)
+    lat, lon = G.grid_to_latlon(e, n_, epsg)
     xyz = dict(zip(names, G.geodetic_to_ecef(lat, lon, h)))
     out = ["@%Unit:                m", "@%Coordinate type:     Cartesian"]
     for a, b in pairs:

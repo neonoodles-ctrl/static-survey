@@ -50,7 +50,7 @@ class Stage:
         if self.state == RUNNING:
             return False
         if not runnable(job):
-            self.note = f"Nothing to run in {folder}: no CompNet project (.TRV) and no GSI or .asc files."
+            self.note = f"Nothing to run in {folder}: no CompNet project (.TRV or .GPS) and no GSI or .asc files."
             return False
         self.folder, self.job, self.note, self.error, self.outputs = folder, job, "", "", {}
         self.state = READY

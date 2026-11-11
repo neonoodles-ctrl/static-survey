@@ -8,6 +8,12 @@ from static_survey.adjust import SEC
 from static_survey.rawjob import Instrument, RawJob, build, reduce_gsi
 from static_survey.io.gsi import read_gsi
 
+from pathlib import Path
+
+import numpy as np
+
+from static_survey import geodesy as G
+from static_survey.io.infinity import Baseline
 from synthetic import N0, TRUE, write_asc, write_gsi
 
 
@@ -92,3 +98,59 @@ def test_raw_files_to_coordinates(tmp_path):
     res = adjust(net)
     for n, c in TRUE.items():
         assert math.dist(res.coords[n], c) < 0.002, n
+
+
+ROOT = Path(__file__).resolve().parents[1]
+GNSS_PAIRS = (("A", "B"), ("A", "E"), ("B", "C"), ("C", "D"), ("D", "E"), ("E", "F"), ("F", "B"), ("A", "C"))
+
+
+def _scratch(name):
+    d = ROOT / "output" / "scratch" / "pytest-rawjob" / name
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _baseline(frm, to, lon_from, lon_to, lat=-31.5):
+    a, b = (G.geodetic_to_ecef(lat, math.radians(lon), 300.0) for lon in (lon_from, lon_to))
+    a, b = (np.atleast_2d(x)[0] for x in (a, b))
+    return Baseline(frm, to, tuple(a), tuple(b - a), 1.0, (1e-6, 0, 0, 1e-6, 0, 1e-6), 0.0, 0.0, "", "x.asc")
+
+
+def test_asc_positions_set_the_zone():
+    """A GNSS job in zone 55 computed as zone 56 is tens of metres out with no warning; the .asc says where it is."""
+    a = _scratch("zone55") / "job.asc"
+    write_asc(a, GNSS_PAIRS, epsg=7855)
+    job = RawJob(asc=[a], fixed={"A": TRUE["A"], "C": TRUE["C"]}, geoid_table={n: N0 for n in TRUE})
+    net, _ = build(job)
+    assert (net.epsg, net.grid) == (7855, "MGA2020 zone 55")
+    res = adjust(net)
+    for n, c in TRUE.items():
+        assert math.dist(res.coords[n], c) < 0.002, n
+
+
+def test_asc_positions_in_two_zones_or_an_unhandled_zone_stop_the_job():
+    from static_survey.rawjob import Unsupported, asc_zone
+
+    assert asc_zone([_baseline("P", "Q", 146.0, 146.1)]) == 55
+    assert asc_zone([_baseline("P", "Q", 151.0, 151.1)]) == 56
+    with pytest.raises(Unsupported, match=r"more than one MGA zone: zone 55: P; zone 56: Q"):
+        asc_zone([_baseline("P", "Q", 149.99, 150.01)])
+    with pytest.raises(Unsupported, match=r"MGA zone 57\. static-survey handles"):
+        asc_zone([_baseline("P", "Q", 160.0, 160.1)])
+
+
+def test_the_command_line_stops_on_a_zone_problem_with_a_message(capsys):
+    from static_survey import cli
+
+    d = _scratch("two-zones")
+    asc, ctl = d / "job.asc", d / "control.csv"
+    b = _baseline("P", "Q", 149.99, 150.01)
+    asc.write_text("\r\n".join([
+        "@+P  {:.4f} {:.4f} {:.4f}".format(*b.from_xyz), "@-Q  {:.4f} {:.4f} {:.4f}".format(*b.dxyz),
+        "@=    0.5000   0.00000010  -0.00000005   0.00000006   0.00000008  -0.00000003   0.00000012",
+        "@:       1.5000        0.0000 ", "@;       1.6000        0.0000 ", "@*01.04.2023 09:00:00", ""]),
+        encoding="latin-1")
+    ctl.write_text("P,700000,6500000,300\n", encoding="utf-8")
+    assert cli.main(["raw", "--asc", str(asc), "--control", str(ctl), "--geoid-grid", "x.tif", "--job", "T"]) == 2
+    err = capsys.readouterr().err
+    assert "static-survey stopped without adjusting T" in err and "more than one MGA zone" in err
