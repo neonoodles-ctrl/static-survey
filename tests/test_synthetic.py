@@ -1,5 +1,7 @@
 import math
 
+import numpy as np
+
 import pytest
 
 from static_survey.adjust import adjust
@@ -230,3 +232,118 @@ def test_weighted_control_corrections_average_zero():
     moved = compare_weighted(net, res, listing(0.001))
     assert abs(moved["mean_compnet"][0] - 1.0) < 0.06
     assert "not the least squares solution" in _weighted_paragraph(moved)[2]
+
+
+def test_held_and_free_control_components():
+    """A weighted mark with standard deviations (0, 0, None) is held in E and N and left free in H (CompNet's FIX
+    and FREE in .STD): E and N come out exactly as given, H from the observations, and the two held components
+    add two degrees of freedom, as two removed unknowns would."""
+    base = build(seed=3)
+    r0 = adjust(base)
+    given = (TRUE["D"][0] + 0.005, TRUE["D"][1] - 0.003, TRUE["D"][2] + 0.050)
+    net = build(seed=3)
+    net.weighted = {"D": (given, (0.0, 0.0, None))}
+    res = adjust(net)
+    assert abs(res.coords["D"][0] - given[0]) < 1e-5 and abs(res.coords["D"][1] - given[1]) < 1e-5
+    assert abs(res.coords["D"][2] - TRUE["D"][2]) < 0.01            # free: not pulled 50 mm up
+    assert res.dof == r0.dof + 2
+
+
+def test_gnss_only_job_is_diagnosed():
+    """A job with GNSS vectors and no total station readings adjusts and runs the cause-finding without the
+    set-by-set checks, which are about total station repeats."""
+    from synthetic import _geom
+    from static_survey.adjust import Vector
+    from static_survey.diagnose import diagnose
+
+    geom = _geom(TRUE)
+    pairs = [("A", "B"), ("A", "D"), ("B", "C"), ("C", "D"), ("D", "E"), ("E", "A"), ("B", "F"), ("F", "D"),
+             ("E", "F"), ("C", "F")]
+    net = build(seed=5)
+    net.sightings = []
+    net.vectors = [Vector(a, b, tuple(geom[b][0] - geom[a][0]), 0.005, 0.010, ref=f"{a}-{b}") for a, b in pairs]
+    res, findings = diagnose(net)
+    assert res.converged and res.dof == 3 * len(pairs) - 3 * 4 - 2   # 4 free marks, GNSS scale and rotation
+    for n in ("B", "D", "E", "F"):
+        assert max(abs(res.coords[n][i] - TRUE[n][i]) for i in range(3)) < 1e-4
+    assert not any(f.kind in ("repeats", "unchecked") for f in findings)
+
+
+def _gnss_net(seed=5, plant=None):
+    """GNSS-only copy of the synthetic network; plant=(pair index, metres) adds that much to a vector's height."""
+    from synthetic import _geom
+    from static_survey import geodesy as G
+    from static_survey.adjust import Vector
+
+    geom = _geom(TRUE)
+    pairs = [("A", "B"), ("A", "D"), ("B", "C"), ("C", "D"), ("D", "E"), ("E", "A"), ("B", "F"), ("F", "D"),
+             ("E", "F"), ("C", "F")]
+    net = build(seed=seed)
+    net.sightings = []
+    net.vectors = []
+    for i, (a, b) in enumerate(pairs):
+        d = geom[b][0] - geom[a][0]
+        if plant and plant[0] == i:
+            d = d + plant[1] * geom[b][1][2]                     # along the local up at b
+        net.vectors.append(Vector(a, b, tuple(d), 0.005, 0.010, ref=f"GPS line {i + 1}"))
+    return net
+
+
+def test_gnss_components_get_their_own_w_test():
+    """Each GNSS component gets Baarda's w from its own residual covariance in E, N, H, so a height planted in one
+    vector tops the table on that vector's dH, and the components' redundancies add up to the degrees of freedom."""
+    from static_survey.diagnose import worst_residuals
+
+    clean = adjust(_gnss_net())
+    assert abs(sum(r["r"] for r in clean.rows if r["kind"] == "GNSS") - clean.dof) < 0.5
+    res = adjust(_gnss_net(plant=(3, 0.06)))                       # 60 mm up on C -> D
+    top = worst_residuals(res, 3, kinds=("DIR", "ZEN", "DIST", "GNSS"))[0]
+    assert (top["frm"], top["to"], top["comp"]) == ("C", "D", "H") and top["w"] > 3.29
+    assert worst_residuals(res, 3) == []                          # the default list is still total station only
+
+
+def test_gnss_only_report_and_held_marks():
+    """A GNSS-only report lists GNSS components among the largest residuals and does not mention refraction; a
+    mark held in E and N shows as held, with no ellipse."""
+    from static_survey.cad import coordinate_rows
+    from static_survey.report import render
+
+    net = _gnss_net()
+    net.weighted = {"D": (TRUE["D"], (0.0, 0.0, None)), "F": (TRUE["F"], (None, None, 0.01))}
+    res = adjust(net)
+    rows = coordinate_rows(net, res)
+    by = {r["name"]: r for r in rows}
+    assert by["D"]["status"] == "held E/N" and by["D"]["a"] is None and by["F"]["status"] == "weighted H"
+    md = render("SYN", net, res, [], [], coords=rows)
+    assert "| GNSS dH |" in md or "| GNSS dE |" in md or "| GNSS dN |" in md
+    assert "refraction" not in md
+    assert "| D | held E/N |" in md and md.split("| D | held E/N |")[1].split("\n")[0].rstrip().endswith("| held |")
+
+
+def test_compnet_implied_geoid_is_named_only_where_it_differs():
+    """CompNet's OBS dH that imply a different N at one mark name that mark with the size; a listing that agrees
+    names nothing."""
+    from types import SimpleNamespace
+
+    from static_survey import geodesy as G
+    from static_survey.report import compare_geoid
+
+    net = _gnss_net()
+    pos = {n: TRUE[n] for n in TRUE}
+
+    def listing(bump):
+        vecs = []
+        for v in net.vectors:
+            e, n, h = pos[v.frm]
+            lat, lon = G.grid_to_latlon(e, n, net.epsg)
+            xa = np.array(G.geodetic_to_ecef(lat, lon, h + net.geoid[v.frm]), float).ravel()
+            _, _, hb = G.ecef_to_geodetic(xa + np.array(v.dxyz))
+            dh = float(hb[0]) - (h + net.geoid[v.frm]) - (net.geoid[v.to] - net.geoid[v.frm])
+            dh -= bump.get(v.to, 0.0) - bump.get(v.frm, 0.0)        # CompNet's N at a mark is higher by bump
+            vecs.append(dict(frm=v.frm, to=v.to, obs_enh=(0.0, 0.0, round(dh, 3))))
+        adjusted = {n: dict(e=c[0], n=c[1], h=c[2]) for n, c in pos.items() if n not in net.fixed}
+        return SimpleNamespace(vectors=vecs, adjusted=adjusted, fixed={n: pos[n] for n in net.fixed})
+
+    assert compare_geoid(net, listing({})) == []
+    found = compare_geoid(net, listing({"E": 0.013}))
+    assert [g["mark"] for g in found] == ["E"] and abs((found[0]["n_compnet"] - found[0]["n_ours"]) - 0.013) < 0.0008

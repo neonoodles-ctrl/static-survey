@@ -1,0 +1,80 @@
+{
+ "window": [
+  1200,
+  720
+ ],
+ "rig_xy": [
+  30,
+  0
+ ],
+ "rig_size": [
+  508,
+  641
+ ],
+ "pixels_per_mm": 1.27,
+ "live": {
+  "sighting_cross": [
+   286.5,
+   201.5,
+   41.5,
+   43.5
+  ],
+  "vertical_circle": [
+   312.0,
+   207.5,
+   57.0,
+   67.5
+  ]
+ },
+ "fields": {
+  "folder": [
+   40,
+   360,
+   660
+  ],
+  "project": [
+   390,
+   640,
+   660
+  ],
+  "options": [
+   670,
+   1160,
+   660
+  ]
+ },
+ "caption": [
+  610,
+  272
+ ],
+ "panel": [
+  588,
+  12,
+  1176,
+  622
+ ],
+ "beam": {
+  "from_xy": [
+   420.9,
+   125.3
+  ],
+  "lands_y": [
+   14.0,
+   31.9,
+   60.5
+  ]
+ },
+ "moves": {
+  "fold": 72,
+  "run": 60,
+  "wait": 24
+ },
+ "fps": 12,
+ "images": [
+  "overlay_start.png",
+  "overlay_ready.png",
+  "overlay_running.png",
+  "overlay_strip.png",
+  "overlay_panel.png"
+ ]
+}

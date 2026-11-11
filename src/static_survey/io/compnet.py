@@ -82,7 +82,19 @@ class Mark:
     e: float
     n: float
     h: float
-    sd: tuple[float, float, float] | None = None  # None means held fixed
+    # None: the whole mark held fixed (.FIX). Otherwise one value per component (.STD): 0 holds that component
+    # fixed, None leaves it free (see std_sd).
+    sd: tuple[float | None, float | None, float | None] | None = None
+
+
+# A .STD standard deviation of 0 holds that component fixed and one of 100 (m) leaves it free: CompNet's listing
+# prints FIX and FREE for them in its WEIGHTED COORDINATE CORRECTIONS table (seen in a CompNet 3.1 GNSS job).
+STD_FREE = 100.0
+
+
+def std_sd(values) -> tuple[float | None, ...]:
+    """.STD standard deviations as the engine takes them: 0 stays 0 (held), 100 m or more becomes None (free)."""
+    return tuple(None if s >= STD_FREE else s for s in values)
 
 
 @dataclass
@@ -97,6 +109,8 @@ class CompnetProject:
     provisional: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     final: dict[str, tuple[float, float, float]] = field(default_factory=dict)
     weight_source: dict[str, str] = field(default_factory=dict)
+    zone: int | None = None   # MGA zone, from the project files (project_zone)
+    datum: str = ""           # 'MGA2020' or 'MGA94' as the listing header says it; '' when only .GPD gave the zone
 
     @property
     def n_setups(self) -> int:
@@ -121,6 +135,9 @@ def read_project(stem: str | Path) -> CompnetProject:
     """Read a CompNet project given the path without extension."""
     stem = Path(stem)
     proj = CompnetProject(stem=stem)
+    proj.zone, where = project_zone(stem)
+    m = re.search(r"MGA\s*(94|2020)", where)
+    proj.datum = f"MGA{m.group(1)}" if m else ""
 
     def f(ext: str) -> Path:
         return stem.with_suffix(ext)
@@ -145,7 +162,7 @@ def read_project(stem: str | Path) -> CompnetProject:
             proj.control[nm] = Mark(nm, v[0], v[1], v[2], None)
     if f(".STD").exists():
         for num, (nm, v) in _read_named_coords(f(".STD")).items():
-            proj.control[nm] = Mark(nm, v[0], v[1], v[2], (v[3], v[4], v[5]))
+            proj.control[nm] = Mark(nm, v[0], v[1], v[2], std_sd(v[3:6]))
     for ext, target in ((".VAR", proj.provisional), (".FIN", proj.final)):
         if f(ext).exists():
             for num, (nm, v) in _read_named_coords(f(ext)).items():
@@ -329,14 +346,16 @@ def read_out(path: str | Path) -> OutListing:
         elif sec == "WEIGHTED COORDINATE CORRECTIONS":
             # name  E vE SR  N vN SR  H vH SR
             p = t.split()
+            # SR is a number, or FIX / FREE for a component held fixed or left free
             if len(p) == 10 and not p[0].lstrip("-").replace(".", "").isdigit():
                 try:
-                    v = [float(x) for x in p[1:]]
+                    e, ve, n, vn, h, vh = (float(p[k]) for k in (1, 2, 4, 5, 7, 8))
+                    sr = [x if x in ("FIX", "FREE") else float(x) for x in (p[3], p[6], p[9])]
                 except ValueError:
-                    v = None
-                if v:
-                    out.weighted[p[0]] = dict(e=v[0], ve=v[1], sr_e=v[2], n=v[3], vn=v[4], sr_n=v[5],
-                                              h=v[6], vh=v[7], sr_h=v[8])
+                    sr = None
+                if sr:
+                    out.weighted[p[0]] = dict(e=e, ve=ve, sr_e=sr[0], n=n, vn=vn, sr_n=sr[1],
+                                              h=h, vh=vh, sr_h=sr[2])
         elif sec == "FIXED COORDINATES":
             p = t.split()
             if len(p) == 5 and p[0].isdigit():
@@ -352,7 +371,11 @@ def read_out(path: str | Path) -> OutListing:
 
 # ------------------------------------------- what this reader cannot handle
 
-HANDLED_ZONES = (56,)
+# MGA zones 49 to 56 cover mainland Australia and Tasmania. MGA94 and MGA2020 use the same projection on the same
+# ellipsoid (GRS80), so a zone is computed with its GDA2020 EPSG code (7800 + zone) whichever datum the listing
+# names; a job stays in its own datum and no datum shift is applied.
+HANDLED_ZONES = tuple(range(49, 57))
+ZONES_TEXT = "MGA zones 49 to 56"
 OBS_SECTIONS = ("DIRECTIONS", "VERTICAL ANGLES", "SLOPE DISTANCES", "GNSS VECTORS")
 OBS_GROUPS = ("Direction", "Vertical angle", "Slope distance", "GNSS")
 # Project files that are read, and files CompNet writes that hold nothing this reader needs: listings,
@@ -422,14 +445,17 @@ def unsupported(stem: str | Path, proj: CompnetProject, out: OutListing | None =
     unread: list[str] = []
     zone, where = project_zone(stem)
     if zone is None and where:
-        problems.append(f"The projection is not an MGA zone ({where}). static-survey only handles MGA zone 56 so far.")
+        problems.append(f"The projection is not an MGA zone ({where}). static-survey handles {ZONES_TEXT}.")
     elif zone is None:
         problems.append("The project does not say which MGA zone it is in: there is no .OUT or .FB listing and no "
-                        ".GPD file. static-survey only handles MGA zone 56 so far, and in another zone the "
-                        "coordinates would come out wrong.")
+                        ".GPD file. In the wrong zone the coordinates would come out wrong, so static-survey "
+                        "does not guess.")
     elif zone not in HANDLED_ZONES:
-        problems.append(f"The project is in MGA zone {zone} ({where}). static-survey only handles MGA zone 56 so far; "
+        problems.append(f"The project is in MGA zone {zone} ({where}). static-survey handles {ZONES_TEXT}; "
                         f"in zone {zone} the coordinates would come out wrong.")
+    if not proj.geoid:
+        problems.append("The project has no geoid separation N (no .N or .WGN file). static-survey works on the "
+                        "ellipsoid and needs N to get there; it does not guess one.")
     have = {p.suffix.upper(): p for p in stem.parent.glob(stem.name + ".*") if p.is_file()}
     for ext, p in sorted(have.items()):
         if ext in READ_FILES or ext in OTHER_FILES:
@@ -501,8 +527,11 @@ def to_network(proj: CompnetProject, start: str = "provisional", sec_per_km: flo
         ))
     vectors = [Vector(v.frm, v.to, v.dxyz, v.sd_h, v.sd_v, ref=f"GPS line {v.line}", cov_xyz=v.vcv)
                for v in proj.vectors]
+    grid = {}
+    if proj.zone in HANDLED_ZONES:  # otherwise the Network default (zone 56); the command line stops first
+        grid = dict(epsg=7800 + proj.zone, grid=f"{proj.datum or 'MGA'} zone {proj.zone}")
     return Network(points=points, geoid=dict(proj.geoid), fixed=fixed, weighted=weighted,
-                   sightings=sightings, vectors=vectors, refraction_k=refraction_k_from_compnet(sec_per_km))
+                   sightings=sightings, vectors=vectors, refraction_k=refraction_k_from_compnet(sec_per_km), **grid)
 
 
 def read_control(path: str | Path):
@@ -517,7 +546,7 @@ def read_control(path: str | Path):
     if path.suffix.upper() in (".FIX", ".STD"):
         for _, (name, v) in _read_named_coords(path).items():
             if len(v) >= 6:
-                weighted[name] = ((v[0], v[1], v[2]), (v[3], v[4], v[5]))
+                weighted[name] = ((v[0], v[1], v[2]), std_sd(v[3:6]))
             else:
                 fixed[name] = (v[0], v[1], v[2])
         return fixed, weighted

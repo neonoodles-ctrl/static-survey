@@ -7,21 +7,22 @@ It never changes your data. Every finding is a proposal with its numbers, for th
 ## Windows program
 
 1. Download `StaticSurvey.exe` from the [Releases](../../releases) page. It needs no install and no internet.
-2. Run it and choose the job folder.
+2. Run it. The window is a pencil drawing of a mining theodolite and its target, and the parts are the controls. Click the **sighting cross** on the target and choose the job folder.
    - With a CompNet project in the folder (`.TRV` and its companion files), it adjusts that project. Any `.GSI` files in the folder supply the instrument timestamps.
    - Otherwise it uses the raw files: `.GSI`, `.asc`, and a `.FIX` or `.STD` file for the control marks.
-3. Press **Run**. Four files are written to the job folder, named after the job, and the report opens in your browser:
+3. The theodolite is now set up and the window lists what it found in the folder. Click the **vertical circle** to run. Four files are written to the job folder, named after the job, and the report is shown in the window:
    - `JOB-report.html` (and `.md`): what was adjusted, the findings, the largest residuals and the adjusted coordinates.
    - `JOB-coordinates.csv`: name, E, N, H, their standard deviations (m) and fixed / weighted / adjusted. The program reads the same layout as control, so one job's marks can be the next job's control.
    - `JOB-network.dxf`: the network for AutoCAD (2000 format, metres, MGA2020 E/N with the AHD height as Z). Layers `SS-CONTROL`, `SS-MARKS`, `SS-NAMES`, `SS-TS`, `SS-GNSS`, `SS-ELLIPSES` (95% error ellipses, enlarged; the enlargement is written on the drawing) and `SS-FLAGGED` (red: readings set aside by the w-test, or named by a finding, labelled with the finding).
 
    The drawing is not called `JOB.dxf` because CompNet writes its own drawing under that name.
+4. Under the report, **open report**, **open drawing**, **open coordinates** and **open job folder** open the files. **run again** repeats the run, **new job** goes back to the start, and **details** shows what the program printed. Closing the window part-way through a run stops the run.
 
 Windows may warn that the program is from an unknown publisher, because it isn't code-signed. Choose **More info**, then **Run anyway**.
 
 ### Options
 
-The options box takes the same options as the command line, for example:
+The options box in the window takes the same options as the command line, for example:
 
 - `--rename STN_1=STN1`: give a mark its project name when the field file booked it under another name.
 - `--exclude "JOB.GSI line 83"`: leave out one reading, as you did in your own adjustment.
@@ -61,7 +62,7 @@ The tests use a made-up 6-mark network with planted mistakes. Each check must fi
 
 - Deflections of the vertical are not modelled. Trig heights are treated as AHD differences, as CompNet does.
 - Only Leica GSI-16, Leica Infinity `.asc` and CompNet 3.x projects are read.
-- Coordinates are MGA2020 zone 56 only. A CompNet project in another zone, or one that doesn't say which zone it is in, stops with a message. So does a project with observation files the program doesn't read, such as levelling, horizontal angles, horizontal distances or azimuths.
+- Coordinates are MGA zones 49 to 56 (MGA94 or MGA2020, the same projection; no datum shift). A CompNet project takes its zone from its own listing or reference position; one in another zone, or one that doesn't say which zone it is in, stops with a message. So does a project with no geoid file (`.N` or `.WGN`), and one with observation files the program doesn't read, such as levelling, horizontal angles, horizontal distances or azimuths. Raw files without a CompNet project are zone 56 only.
 
 ## Geoid
 

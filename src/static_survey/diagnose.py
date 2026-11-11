@@ -1066,8 +1066,9 @@ def unchecked_marks(net: Network, res: Result, r_min: float = 0.02) -> Finding |
     )
 
 
-def worst_residuals(res: Result, n: int = 10) -> list[dict]:
-    rows = [r for r in res.rows if r["kind"] in ("DIR", "ZEN", "DIST") and not math.isnan(r["w"])]
+def worst_residuals(res: Result, n: int = 10, kinds: tuple[str, ...] = ("DIR", "ZEN", "DIST")) -> list[dict]:
+    """The n readings with the largest w. GNSS vector components are left out unless ``kinds`` names "GNSS"."""
+    rows = [r for r in res.rows if r["kind"] in kinds and not math.isnan(r["w"])]
     return sorted(rows, key=lambda r: -r["w"])[:n]
 
 
@@ -1085,10 +1086,11 @@ def diagnose(net: Network, res: Result | None = None, pointing=None) -> tuple[Re
     findings += vertical_check(rest, pointing)
     findings += distance_constants(rest, pointing)
     findings += bad_pointings(rest, pointing, corrections=orientation_corrections(findings, net))
-    n2, groups = set_averaged(net)
-    r2 = adjust(n2)
-    findings.append(repeat_effect(net, res, (n2, r2, groups)))
-    u = unchecked_marks(n2, r2)
-    if u:
-        findings.append(u)
+    if net.sightings:  # repeats and set-by-set checks are about total station readings; a GNSS-only job has none
+        n2, groups = set_averaged(net)
+        r2 = adjust(n2)
+        findings.append(repeat_effect(net, res, (n2, r2, groups)))
+        u = unchecked_marks(n2, r2)
+        if u:
+            findings.append(u)
     return res, findings

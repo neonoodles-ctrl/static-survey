@@ -1,26 +1,23 @@
 """Static Survey for Windows: a small window around the ``static-survey`` command.
 
-Pick a job folder. The window finds a CompNet project (``.TRV`` and friends) or the raw files (Leica GSI,
-Leica Infinity ``.asc`` and a ``.FIX``/``.STD`` control file), runs the adjustment and the cause-finding,
-and writes four files next to the job files, named after the job: ``JOB-report.html`` (opened in the
-browser) and ``.md``, ``JOB-coordinates.csv`` and ``JOB-network.dxf`` for AutoCAD. The DXF is not
-``JOB.dxf`` because CompNet writes its own drawing under that name. Extra command options (``--rename``, ``--exclude``,
+The window is a theodolite drawn in pencil (``static_survey.ui``). Click the sighting cross to pick a job folder.
+The window finds a CompNet project (``.TRV`` and friends) or the raw files (Leica GSI, Leica Infinity ``.asc`` and
+a ``.FIX``/``.STD`` control file). Click the vertical circle to run the adjustment and the cause-finding. It writes
+four files next to the job files, named after the job: ``JOB-report.html`` and ``.md``, ``JOB-coordinates.csv`` and
+``JOB-network.dxf`` for AutoCAD, and shows the report in the window. The DXF is not ``JOB.dxf`` because CompNet
+writes its own drawing under that name. Extra command options (``--rename``, ``--exclude``,
 ``--file-settings`` ...) go in the options box exactly as on the command line.
 
 Started with arguments (``StaticSurvey.exe raw --gsi ...``) it runs the command line instead, without a
-window. Nothing in the job folder is changed except the two report files it writes.
+window. Nothing in the job folder is changed except the report files it writes.
 """
 
 from __future__ import annotations
 
-import io
 import os
 import shlex
+import subprocess
 import sys
-import threading
-import traceback
-import webbrowser
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 GEOID_GRID = "au_ga_AUSGeoid2020_20180201.tif"
@@ -114,140 +111,48 @@ def to_html(md_path: Path) -> Path:
     return html
 
 
-def run_command(argv: list[str]) -> str:
-    """Run the command line in-process and return what it printed."""
-    from static_survey.cli import main as cli_main
+FROM_WINDOW = "STATIC_SURVEY_FROM_WINDOW"     # set for the command line the window starts
+_running: subprocess.Popen | None = None
 
-    buf = io.StringIO()
-    with redirect_stdout(buf), redirect_stderr(buf):
-        code = cli_main(argv)
-    if code:
-        raise RuntimeError(buf.getvalue() or f"static-survey exited with {code}")
-    return buf.getvalue()
+
+def self_command() -> list[str]:
+    """How to start this program again: the exe itself when built, ``python -m static_survey.app`` otherwise."""
+    return [sys.executable] if getattr(sys, "frozen", False) else [sys.executable, "-m", "static_survey.app"]
+
+
+def run_command(argv: list[str]) -> str:
+    """Run the command line in a process of its own and return what it printed.
+
+    In the window's own process the adjustment held up the drawing: the moves stalled for up to half a second.
+    """
+    global _running
+    quiet = getattr(subprocess, "CREATE_NO_WINDOW", 0)       # Windows: no console flashing up
+    child = subprocess.Popen(self_command() + argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, env={**os.environ, FROM_WINDOW: "1"}, creationflags=quiet)
+    _running = child
+    try:
+        printed = child.communicate()[0].decode("utf-8", errors="replace")
+    finally:
+        _running = None
+    if child.returncode:
+        raise RuntimeError(printed or f"static-survey exited with {child.returncode}")
+    return printed
+
+
+def stop_running() -> bool:
+    """Stop the run in hand, if there is one. For when the window is closed part-way."""
+    child = _running
+    if child is None:
+        return False
+    child.terminate()
+    return True
 
 
 def gui() -> None:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    """Open the window (``static_survey.ui.window``). A folder given as the only argument is chosen at once."""
+    from static_survey.ui.window import run
 
-    root = tk.Tk()
-    root.title("Static Survey")
-    root.geometry("760x520")
-    frm = ttk.Frame(root, padding=12)
-    frm.pack(fill="both", expand=True)
-    frm.columnconfigure(1, weight=1)
-
-    folder_var = tk.StringVar(value=sys.argv[1] if len(sys.argv) == 2 and Path(sys.argv[1]).is_dir() else "")
-    project_var = tk.StringVar()
-    options_var = tk.StringVar()
-    state = {"job": None, "report": None}
-
-    ttk.Label(frm, text="Job folder").grid(row=0, column=0, sticky="w")
-    ttk.Entry(frm, textvariable=folder_var).grid(row=0, column=1, sticky="ew", padx=6)
-    ttk.Button(frm, text="Browse...", command=lambda: pick()).grid(row=0, column=2)
-
-    ttk.Label(frm, text="CompNet project").grid(row=1, column=0, sticky="w", pady=(8, 0))
-    project_box = ttk.Combobox(frm, textvariable=project_var, state="readonly")
-    project_box.grid(row=1, column=1, sticky="ew", padx=6, pady=(8, 0))
-
-    ttk.Label(frm, text="Found").grid(row=2, column=0, sticky="nw", pady=(8, 0))
-    found = tk.Text(frm, height=7, wrap="word", relief="solid", borderwidth=1)
-    found.grid(row=2, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-
-    ttk.Label(frm, text="Options").grid(row=3, column=0, sticky="w", pady=(8, 0))
-    ttk.Entry(frm, textvariable=options_var).grid(row=3, column=1, columnspan=2, sticky="ew", padx=6, pady=(8, 0))
-    ttk.Label(frm, text='Same as the command line, e.g. --rename STN_1=STN1 --exclude "JOB.GSI line 83"',
-              foreground="#666").grid(row=4, column=1, columnspan=2, sticky="w", padx=6)
-
-    buttons = ttk.Frame(frm)
-    buttons.grid(row=5, column=0, columnspan=3, sticky="w", pady=10)
-    run_btn = ttk.Button(buttons, text="Run", command=lambda: start())
-    run_btn.pack(side="left")
-    open_btn = ttk.Button(buttons, text="Open report", state="disabled",
-                          command=lambda: webbrowser.open(state["report"].as_uri()))
-    open_btn.pack(side="left", padx=8)
-
-    log = tk.Text(frm, height=9, wrap="word", relief="solid", borderwidth=1, background="#f7f9fb")
-    log.grid(row=6, column=0, columnspan=3, sticky="nsew")
-    frm.rowconfigure(6, weight=1)
-    ttk.Label(frm, text="AUSGeoid2020 grid © Geoscience Australia, CC BY 4.0. The job files are never changed.",
-              foreground="#666").grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-    def say(text: str) -> None:
-        log.insert("end", text.rstrip() + "\n")
-        log.see("end")
-
-    def show(*_):
-        found.delete("1.0", "end")
-        text = folder_var.get().strip().strip('"')
-        folder = Path(text).resolve() if text else Path(text)
-        if not text or not folder.is_dir():
-            state["job"] = None
-            return
-        job = find_job(folder)
-        state["job"] = job
-        project_box["values"] = [p.name for p in job["projects"]]
-        if job["projects"] and project_var.get() not in project_box["values"]:
-            project_var.set(job["projects"][0].name)
-        mode = "CompNet project" if job["projects"] else ("Raw files" if job["gsi"] or job["asc"] else "nothing to run")
-        lines = [f"Mode: {mode}"]
-        if job["projects"]:
-            lines.append("Projects: " + ", ".join(p.name for p in job["projects"]))
-        for key, label in (("gsi", "GSI"), ("asc", "Infinity .asc"), ("control", "Control")):
-            if job[key]:
-                lines.append(f"{label}: " + ", ".join(p.name for p in job[key]))
-        found.insert("end", "\n".join(lines))
-
-    def pick():
-        d = filedialog.askdirectory(title="Choose the job folder")
-        if d:
-            folder_var.set(d)
-
-    def start():
-        text = folder_var.get().strip().strip('"')
-        folder = Path(text).resolve() if text else Path(text)
-        if not text or not folder.is_dir() or not state["job"]:
-            messagebox.showwarning("Static Survey", "Choose a job folder first.")
-            return
-        project = next((p for p in state["job"]["projects"] if p.name == project_var.get()), None)
-        try:
-            argv = command_for(folder, state["job"], options_var.get(), project)
-        except ValueError as e:
-            messagebox.showwarning("Static Survey", str(e))
-            return
-        run_btn["state"] = "disabled"
-        say("Running: static-survey " + " ".join(shlex.quote(a) for a in argv))
-
-        def work():
-            try:
-                printed = run_command(argv)
-                o = outputs_for(folder, job_name(folder, state["job"], project))
-                html = to_html(o["md"])
-                root.after(0, done, printed, html, [o["csv"], o["dxf"]], None)
-            except RuntimeError as e:  # the command stopped and said why: show all of it
-                root.after(0, done, "", None, [], str(e), str(e).strip())
-            except Exception:  # shown to the user, not swallowed
-                root.after(0, done, "", None, [], traceback.format_exc())
-
-        threading.Thread(target=work, daemon=True).start()
-
-    def done(printed, html, others, error, message=None):
-        run_btn["state"] = "normal"
-        if error:
-            say(error)
-            messagebox.showerror("Static Survey", message or error.strip().splitlines()[-1])
-            return
-        say(printed)
-        say(f"Report: {html}")
-        for f in others:
-            say(f"Written: {f}")
-        state["report"] = html
-        open_btn["state"] = "normal"
-        webbrowser.open(html.as_uri())
-
-    folder_var.trace_add("write", show)
-    show()
-    root.mainloop()
+    run(sys.argv[1] if len(sys.argv) == 2 and Path(sys.argv[1]).is_dir() else None)
 
 
 def main() -> int:
@@ -258,6 +163,10 @@ def main() -> int:
         sys.stderr = open(os.devnull, "w")
     if len(sys.argv) > 1 and sys.argv[1] in ("compnet", "raw"):
         from static_survey.cli import main as cli_main
+
+        if os.environ.get(FROM_WINDOW):         # the window reads what is printed as UTF-8
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
 
         return cli_main(sys.argv[1:])
     gui()

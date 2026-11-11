@@ -43,9 +43,14 @@ def compare_weighted(net: Network, res: Result, out) -> dict | None:
         return None
     mean_ours, mean_cn = [], []
     for c, key in enumerate(("ve", "vn", "vh")):
-        w = np.array([1 / net.weighted[n][1][c] ** 2 for n in names])
-        v_ours = np.array([res.coords[n][c] - net.weighted[n][0][c] for n in names])
-        v_cn = np.array([out.weighted[n][key] for n in names])
+        use = [n for n in names if net.weighted[n][1][c]]  # components held (0) or free (None) carry no weight
+        if not use:
+            mean_ours.append(0.0)
+            mean_cn.append(0.0)
+            continue
+        w = np.array([1 / net.weighted[n][1][c] ** 2 for n in use])
+        v_ours = np.array([res.coords[n][c] - net.weighted[n][0][c] for n in use])
+        v_cn = np.array([out.weighted[n][key] for n in use])
         mean_ours.append(float((w * v_ours).sum() / w.sum() * 1000))
         mean_cn.append(float((w * v_cn).sum() / w.sum() * 1000))
     # coordinate difference against CompNet's own printed standard deviation, worst component
@@ -57,6 +62,46 @@ def compare_weighted(net: Network, res: Result, out) -> dict | None:
                 if worst is None or ratio > worst["ratio"]:
                     worst = dict(mark=n, comp="ENH"[c], diff=(res.coords[n][c] - a[k]) * 1000, sd=a[s] * 1000, ratio=ratio)
     return dict(n=len(names), mean_ours=mean_ours, mean_compnet=mean_cn, worst=worst)
+
+
+def compare_geoid(net: Network, out, tol: float = 0.001) -> list[dict]:
+    """Marks where CompNet's own observed GNSS height differences imply a geoid separation N more than ``tol``
+    (m) from ours.
+
+    Each vector, taken from CompNet's final position of its first mark, gives the ellipsoidal height difference;
+    our N turns it into the observed AHD difference, which CompNet prints as OBS dH. Any difference between the two
+    is CompNet's N difference along the vector minus ours. One N offset per mark is fitted to all vectors by least
+    squares and taken against the median offset, so a single odd mark stands out. Returns one dict per mark beyond
+    ``tol`` once rounded to 0.1 mm as the report prints it: mark, N ours and implied (m), vectors."""
+    from . import geodesy as G
+
+    if not net.vectors or len(out.vectors) != len(net.vectors):
+        return []
+    pos = {n: (a["e"], a["n"], a["h"]) for n, a in out.adjusted.items()}
+    pos.update({n: tuple(v) for n, v in out.fixed.items()})
+    n_mean = float(np.mean(list(net.geoid.values()))) if net.geoid else 0.0
+    N = lambda m: net.geoid.get(m, n_mean)  # noqa: E731
+    marks = sorted({m for v in net.vectors for m in (v.frm, v.to)})
+    col = {m: i for i, m in enumerate(marks)}
+    rows, rhs, count = [], [], {m: 0 for m in marks}
+    for v, o in zip(net.vectors, out.vectors):
+        if (v.frm, v.to) != (o["frm"], o["to"]) or v.frm not in pos:
+            return []  # the listing does not pair up with the project's vectors
+        e, n, h = pos[v.frm]
+        lat, lon = G.grid_to_latlon(e, n, net.epsg)
+        xa = np.array(G.geodetic_to_ecef(lat, lon, h + N(v.frm)), float).ravel()
+        _, _, hb = G.ecef_to_geodetic(xa + np.array(v.dxyz))
+        ours = float(hb[0]) - (h + N(v.frm)) - (N(v.to) - N(v.frm))
+        a = np.zeros(len(marks))
+        a[col[v.to]], a[col[v.frm]] = 1.0, -1.0
+        rows.append(a)
+        rhs.append(ours - o["obs_enh"][2])
+        count[v.frm] += 1
+        count[v.to] += 1
+    x = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)[0]
+    x -= np.median(x)
+    return [dict(mark=m, n_ours=N(m), n_compnet=N(m) + float(x[col[m]]), vectors=count[m])
+            for m in marks if round(abs(x[col[m]]) * 1000, 1) > tol * 1000]  # as printed, to 0.1 mm
 
 
 def compare_with_compnet(res: Result, out, net: Network | None = None) -> dict:
@@ -74,7 +119,8 @@ def compare_with_compnet(res: Result, out, net: Network | None = None) -> dict:
                 gnss_compnet=out.gnss_params, sd_ratio_median=float(np.median(sd_ratio)) if sd_ratio else None,
                 residuals=compare_residuals(res, out),
                 weighted=compare_weighted(net, res, out) if net is not None else None,
-                n_weighted=3 * len(net.weighted) if net is not None else 0)
+                n_weighted=sum(bool(s) for _, sd in net.weighted.values() for s in sd) if net is not None else 0,
+                geoid=compare_geoid(net, out) if net is not None and getattr(out, "vectors", None) else [])
 
 
 def _explained_by(row: dict, findings: list[Finding]) -> str:
@@ -116,7 +162,8 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
              + (f", {len(net.weighted)} weighted" if net.weighted else "") + ".")
     L.append(f"- {n_dir} directions, {n_zen} vertical angles, {n_dist} slope distances in "
              f"{len({s.setup for s in net.sightings})} setups; {len(net.vectors)} GNSS vectors.")
-    L.append(f"- Rigorous 3D model on GRS80 (MGA2020 EPSG:{net.epsg}); refraction k = {net.refraction_k:.3f}"
+    L.append(f"- Rigorous 3D model on GRS80 ({net.grid}, projection EPSG:{net.epsg})"
+             + (f"; refraction k = {net.refraction_k:.3f}" if net.sightings else "")
              + ("; GNSS scale and rotation estimated" if net.vectors else "") + ".")
     L.append(f"- Result: variance factor {res.vf:.3f}, {res.dof} degrees of freedom, "
              f"{'converged' if res.converged else 'NOT converged'} in {res.iterations} iterations.")
@@ -164,11 +211,19 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
                      f"{abs(c['gnss_compnet'].get('Horizontal rotation', 0))}\" |")
         L.append("")
         if dof_note:
-            L.append(f"CompNet does not count the {c['n_weighted']} weighted coordinates as observations: "
+            L.append(f"CompNet does not count the {c['n_weighted']} weighted "
+                     f"{'coordinate' if c['n_weighted'] == 1 else 'coordinates'} as observations: "
                      f"{c['dof']} = {c['dof_compnet']} + {c['n_weighted']}.")
             L.append("")
         if wc:
             L += _weighted_paragraph(wc)
+        if c.get("geoid"):
+            items = "; ".join(f"{g['mark']} {(g['n_compnet'] - g['n_ours']) * 1000:+.1f} mm ({g['n_ours']:.3f} m in the "
+                              f".WGN, {g['n_compnet']:.3f} m implied; {g['vectors']} vector{'s' if g['vectors'] != 1 else ''})"
+                              for g in c["geoid"])
+            L.append("CompNet's own observed height differences (OBS dH) imply a geoid separation N more than 1 mm "
+                     f"from the project's .WGN at: {items}. The heights here use the .WGN values.")
+            L.append("")
         if c["sd_ratio_median"]:
             r = c["sd_ratio_median"]
             if f"{r:.2f}" == "1.00":
@@ -206,16 +261,17 @@ def render(job: str, net: Network, res: Result, findings: list[Finding], sources
     L.append("")
     L.append("| Obs | From → To | w | Residual | Source | Explained by |")
     L.append("|---|---|---|---|---|---|")
-    for r in worst_residuals(res, 12):
+    for r in worst_residuals(res, 12, kinds=("DIR", "ZEN", "DIST", "GNSS")):
         val = f"{r['res_sec']:+.1f}\"" if "res_sec" in r else f"{r['res'] * 1000:+.1f} mm"
-        L.append(f"| {r['kind']} | {r['frm']} → {r['to']} | {r['w']:.2f} | {val} | {r['ref']}"
+        kind = f"GNSS {'dE dN dH'.split()['ENH'.index(r['comp'])]}" if r["kind"] == "GNSS" else r["kind"]
+        L.append(f"| {kind} | {r['frm']} → {r['to']} | {r['w']:.2f} | {val} | {r['ref']}"
                  f"{' ' + r['time'] if r.get('time') else ''} | {_explained_by(r, findings) or '—'} |")
     L.append("")
     L.append("w is the residual divided by its own standard deviation (Baarda's w-test). CompNet prints the "
              "residual divided by the observation's standard deviation; the two are close when redundancy is high.")
     L.append("")
     if coords:
-        L += _coordinates(res, coords, files)
+        L += _coordinates(res, coords, files, net.grid)
     if notes:
         L.append("## Notes and limits")
         L.append("")
@@ -250,7 +306,7 @@ def _weighted_paragraph(wc: dict) -> list[str]:
     return L
 
 
-def _coordinates(res: Result, rows: list[dict], files: list[str] | None) -> list[str]:
+def _coordinates(res: Result, rows: list[dict], files: list[str] | None, grid: str = "MGA2020 zone 56") -> list[str]:
     from .cad import sd_scale
 
     k = sd_scale(res)
@@ -258,7 +314,7 @@ def _coordinates(res: Result, rows: list[dict], files: list[str] | None) -> list
     if files:
         L.append("Also written: " + ", ".join(f"`{f}`" for f in files) + ".")
         L.append("")
-    L.append("MGA2020 zone 56, AHD heights. Standard deviations are the a-priori ones from the instrument settings"
+    L.append(f"{grid}, AHD heights. Standard deviations are the a-priori ones from the instrument settings"
              + (f", scaled up by √(variance factor) = {k:.2f} because the variance factor is above 1." if k > 1 else
                 "; the variance factor is not above 1, so they are not scaled.")
              + " The 95% error ellipse is the horizontal area the mark lies in with 95% confidence: half-length of "
@@ -270,8 +326,10 @@ def _coordinates(res: Result, rows: list[dict], files: list[str] | None) -> list
         if r["status"] == "fixed":
             sds, ell = "| — | — | —", "held fixed"
         else:
-            sds = f"| {r['sd_e'] * 1000:.1f} | {r['sd_n'] * 1000:.1f} | {r['sd_h'] * 1000:.1f}"
-            ell = f"{r['a'] * 1000:.1f} × {r['b'] * 1000:.1f} at {r['bearing']:.0f}°"
+            held = r.get("held", "")
+            sds = "".join(" | —" if c in held else f" | {r[k] * 1000:.1f}" for c, k in zip("ENH", ("sd_e", "sd_n", "sd_h")))
+            sds = "|" + sds[2:]
+            ell = "held" if r["a"] is None else f"{r['a'] * 1000:.1f} × {r['b'] * 1000:.1f} at {r['bearing']:.0f}°"
         L.append(f"| {r['name']} | {r['status']} | {r['e']:.4f} | {r['n']:.4f} | {r['h']:.4f} {sds} | {ell} |")
     L.append("")
     return L

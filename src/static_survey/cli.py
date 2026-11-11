@@ -44,9 +44,14 @@ def _compnet(args) -> int:
     sources = [p.name for p in sorted(stem.parent.glob(stem.name + ".*"))
                if p.suffix.upper() in (".TRV", ".DIR", ".VRT", ".SLP", ".GPS", ".VCV", ".FIX", ".STD", ".WGN", ".N",
                                        ".VAR", ".OUT")]
-    notes = [f"Weights taken from CompNet's {', '.join(sorted(set(proj.weight_source.values())))} files, "
-             "as CompNet uses them (rounded copies of the .TRV values).",
-             f"MGA zone 56, from {project_zone(stem)[1]}."]
+    notes = [f"MGA zone {proj.zone}, from {project_zone(stem)[1]}."]
+    if proj.sightings:  # total station weights; a GNSS-only job has none
+        notes.insert(0, f"Weights taken from CompNet's {', '.join(sorted(set(proj.weight_source.values())))} files, "
+                        "as CompNet uses them (rounded copies of the .TRV values).")
+    if proj.datum == "MGA94" or not proj.datum:
+        notes.append(f"Projected with EPSG:{net.epsg} (GDA2020 / MGA zone {proj.zone}). MGA94 and MGA2020 use the "
+                     "same projection on the same ellipsoid, so the coordinates stay in the project's own datum; "
+                     "no datum shift is applied.")
     if unread:
         notes.append("Not read, because they hold no observations: " + ", ".join(f"`{u}`" for u in unread) + ".")
     if proj.disabled:
@@ -60,10 +65,11 @@ def _compnet(args) -> int:
         notes.append(f"Instrument timestamps matched to {timed} of {len(net.sightings)} sightings.")
     res, findings = diagnose(net)
     compare = compare_with_compnet(res, out, net) if out is not None else None
-    notes.append("Deflections of the vertical are not modelled; trig heights are treated as AHD differences, "
-                 "as CompNet does.")
-    notes.append("Vertical residuals here are on zenith angles (computed minus observed). CompNet prints vertical "
-                 "angles, so its signs are reversed: +20\" here is -20\" in CompNet's listing.")
+    if net.sightings:  # both are about total station readings
+        notes.append("Deflections of the vertical are not modelled; trig heights are treated as AHD differences, "
+                     "as CompNet does.")
+        notes.append("Vertical residuals here are on zenith angles (computed minus observed). CompNet prints vertical "
+                     "angles, so its signs are reversed: +20\" here is -20\" in CompNet's listing.")
     rows, files = _cad_files(args, args.job or stem.name, net, res, findings)
     md = render(args.job or stem.name, net, res, findings, sources, compare, notes, coords=rows, files=files)
     if args.out:

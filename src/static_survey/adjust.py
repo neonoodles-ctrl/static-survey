@@ -23,6 +23,7 @@ distance scale, or a target height error.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -63,6 +64,11 @@ class Vector:
     cov_xyz: tuple[float, float, float, float, float, float] | None = None
     # True: cov_xyz is the vector's covariance as it stands (DynAdjust); False: only its correlations are used
     cov_given: bool = False
+
+
+# A weighted control component with standard deviation 0 is held: weighted at 0.001 mm (DynAdjust holds
+# constrained components the same way). It counts as one degree of freedom, as a removed unknown would.
+HELD_SD = 1e-6
 
 
 @dataclass
@@ -131,10 +137,13 @@ class Network:
     points: dict[str, tuple[float, float, float]]          # provisional E, N, H
     geoid: dict[str, float]
     fixed: dict[str, tuple[float, float, float]]            # held exactly
-    weighted: dict[str, tuple[tuple[float, float, float], tuple[float, float, float]]] = field(default_factory=dict)
+    # weighted control: value and standard deviation per component; an sd of 0 holds that component (HELD_SD),
+    # None leaves it free
+    weighted: dict[str, tuple[tuple[float, float, float], tuple[float | None, float | None, float | None]]] = field(default_factory=dict)
     sightings: list[Sighting] = field(default_factory=list)
     vectors: list[Vector] = field(default_factory=list)
     epsg: int = 7856
+    grid: str = "MGA2020 zone 56"   # what reports and drawings call the coordinates; epsg is the projection used
     refraction_k: float = 0.16
     gnss_scale: bool = True
     gnss_rotation: bool = True
@@ -353,7 +362,7 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
             extra_val[(k, m)] = ex.values[pos] if ex.values is not None else 1.0
 
     n_obs = sum((s.hz is not None) + (s.zen is not None) + (s.slope is not None) for s in net.sightings)
-    n_obs += 3 * len(net.vectors) + 3 * len(net.weighted)
+    n_obs += 3 * len(net.vectors) + sum(s is not None for _, sd in net.weighted.values() for s in sd)
     n_obs += sum(len(o.value) if o.kind == "POS" else 1 for o in net.measurements) + len(net.constraints)
     # Constraint axes, fixed once at each reference position.
     con_axis = []
@@ -490,7 +499,8 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
             model = (1 + sc) * Rot @ dX
             Ri = R[i]
             cov = _vector_cov(v, Ri)
-            Linv = np.linalg.inv(np.linalg.cholesky(cov))
+            Lc = np.linalg.cholesky(cov)
+            Linv = np.linalg.inv(Lc)
             rows = slice(r, r + 3)
             M = (1 + sc) * Rot
             for pt, sgn in ((j, 1.0), (i, -1.0)):
@@ -507,14 +517,17 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
             sds = np.sqrt(np.diag(Ri @ cov @ Ri.T)) if v.cov_given else (v.sd_h, v.sd_h, v.sd_v)
             for comp in range(3):
                 meta.append(dict(kind="GNSS", vi=vi, comp="ENH"[comp], frm=v.frm, to=v.to, ref=v.ref,
-                                 enu_R=Ri, model=model, obs=np.array(v.dxyz), sd=float(sds[comp])))
+                                 enu_R=Ri, model=model, obs=np.array(v.dxyz), sd=float(sds[comp]), chol=Lc))
             r += 3
 
         for n, (val, sd) in net.weighted.items():
             for comp in range(3):
-                A[r, col[n] + comp] = 1.0 / sd[comp]
-                w[r] = (val[comp] - enh[idx[n], comp]) / sd[comp]
-                meta.append(dict(kind="CTRL", frm=n, to=n, comp="ENH"[comp], obs=val[comp], model=enh[idx[n], comp], sigma=sd[comp], ref="weighted control"))
+                if sd[comp] is None:  # left free
+                    continue
+                s = sd[comp] or HELD_SD
+                A[r, col[n] + comp] = 1.0 / s
+                w[r] = (val[comp] - enh[idx[n], comp]) / s
+                meta.append(dict(kind="CTRL", frm=n, to=n, comp="ENH"[comp], obs=val[comp], model=enh[idx[n], comp], sigma=s, ref="weighted control"))
                 r += 1
 
         r = _more_rows(net, A, w, meta, r, idx, col, names, enh, nvals, xyz_g, jac_g, R, lat, con_axis)
@@ -562,10 +575,20 @@ def adjust(net: Network, extras: list[Extra] | None = None, max_iter: int = 20, 
         if m["kind"] == "GNSS" and m["comp"] == "E":
             v_xyz = m["model"] - m["obs"]
             v_enu = m["enu_R"] @ v_xyz
+            # The three rows are whitened together, so their own w and redundancy belong to combinations of
+            # E, N and H. Baarda's w and the redundancy per local component come from the residual covariance
+            # turned back into E, N, H: Qv = T (I - A Q A') T', T = R L.
+            T = m["enu_R"] @ m["chol"]
+            Ar = A[k:k + 3]
+            Qv = T @ (np.eye(3) - Ar @ Q @ Ar.T) @ T.T
+            C = T @ T.T
             for c3 in range(3):
                 rows_out[k + c3]["res"] = float(v_enu[c3])
                 rows_out[k + c3]["res_xyz"] = float(v_xyz[c3])
                 rows_out[k + c3]["v_over_sigma"] = abs(v_enu[c3]) / m["sd"]
+                q = float(Qv[c3, c3])
+                rows_out[k + c3]["r"] = float(np.clip(q / C[c3, c3], 0.0, 1.0))
+                rows_out[k + c3]["w"] = abs(float(v_enu[c3])) / math.sqrt(q) if q > 1e-9 * C[c3, c3] else float("nan")
         if m["kind"] == "POS" and m["comp"] == 0:
             n3 = m["n3"]
             v_xyz = m["chol"] @ vw[k:k + n3]          # computed minus observed, metres

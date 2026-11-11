@@ -1,6 +1,6 @@
 """Files for the surveyor's own software: adjusted coordinates (CSV) and a network drawing (DXF for AutoCAD).
 
-The drawing follows the conventions of CompNet's own DXF so it reads the same in AutoCAD: real MGA2020 eastings
+The drawing follows the conventions of CompNet's own DXF so it reads the same in AutoCAD: real MGA eastings
 and northings with the AHD height as Z, metres, a two-circle symbol (radii 0.75 m and 1.5 m) on control marks
 and a one-circle symbol on adjusted marks, 1 m names. Layer names start with ``SS-`` so they never clash with
 CompNet's layers when both drawings are in one file.
@@ -50,15 +50,25 @@ def coordinate_rows(net: Network, res: Result) -> list[dict]:
     for n in sorted(res.coords):
         e, nn, h = res.coords[n]
         status = "fixed" if n in net.fixed else ("weighted" if n in net.weighted else "adjusted")
-        row = dict(name=n, e=e, n=nn, h=h, status=status, sd_e=None, sd_n=None, sd_h=None, a=None, b=None, bearing=None)
+        held = ""
+        if n in net.weighted:  # a .STD standard deviation of 0 holds that component, None leaves it free
+            sd = net.weighted[n][1]
+            held = "".join(c for c, s in zip("ENH", sd) if s == 0)
+            weighted = "".join(c for c, s in zip("ENH", sd) if s)
+            parts = (["held " + "/".join(held)] if held else []) + (
+                ["weighted" + ("" if weighted == "ENH" else " " + "/".join(weighted))] if weighted else [])
+            status = ", ".join(parts) or "adjusted"
+        row = dict(name=n, e=e, n=nn, h=h, status=status, held=held, sd_e=None, sd_n=None, sd_h=None, a=None, b=None,
+                   bearing=None)
         if status != "fixed":
             c = np.array(res.cov[n]) * k * k
             row.update(sd_e=math.sqrt(c[0, 0]), sd_n=math.sqrt(c[1, 1]), sd_h=math.sqrt(c[2, 2]))
             lam, vec = np.linalg.eigh(c[:2, :2])          # ascending
             lam = np.clip(lam, 0.0, None)
             ve, vn = vec[:, 1]
-            row.update(a=K2_95 * math.sqrt(lam[1]), b=K2_95 * math.sqrt(lam[0]),
-                       bearing=math.degrees(math.atan2(ve, vn)) % 180.0)
+            if "E" not in held or "N" not in held:  # no ellipse where E and N are both held
+                row.update(a=K2_95 * math.sqrt(lam[1]), b=K2_95 * math.sqrt(lam[0]),
+                           bearing=math.degrees(math.atan2(ve, vn)) % 180.0)
         rows.append(row)
     return rows
 
@@ -196,7 +206,7 @@ def write_dxf(path: str | Path, job: str, net: Network, res: Result, rows: list[
 
     es = [r["e"] for r in rows]; ns = [r["n"] for r in rows]
     x0, y0 = min(es), min(ns) - 0.05 * max(max(ns) - min(ns), 50.0)
-    msp.add_text(f"{job} - adjusted by static-survey {date.today().isoformat()} - MGA2020 zone 56, AHD heights, metres",
+    msp.add_text(f"{job} - adjusted by static-survey {date.today().isoformat()} - {net.grid}, AHD heights, metres",
                  height=2.0, dxfattribs={"layer": "SS-NAMES"}).set_placement((x0, y0), align=TextEntityAlignment.BOTTOM_LEFT)
     msp.add_text(f"Error ellipses: 95% confidence, drawn {scale:,.0f} times actual size",
                  height=1.5, dxfattribs={"layer": "SS-ELLIPSES"}).set_placement((x0, y0 - 4.0),
