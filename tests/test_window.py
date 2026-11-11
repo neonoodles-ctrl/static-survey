@@ -26,7 +26,7 @@ def test_a_folder_with_nothing_to_run_is_turned_down_and_says_why():
     s = st.Stage()
     assert not s.choose(Path("/jobs/b"), EMPTY)
     assert s.state == st.START and s.job is None
-    assert "/jobs/b" in s.note and ".TRV" in s.note
+    assert str(Path("/jobs/b")) in s.note and ".TRV" in s.note     # Windows writes the path with backslashes
 
 
 def test_run_needs_a_folder_and_cannot_start_twice():
